@@ -61,14 +61,22 @@ import type { Theme } from "../../modes/interactive/theme/theme.ts";
 import type { BashResult } from "../bash-executor.ts";
 import type { CacheWarmingDecisionEvent, CacheWarmingDecisionEventResult } from "../cache-warmer.ts";
 import type { CompactionPreparation, CompactionResult } from "../compaction/index.ts";
+import type { COORDINATION_SCHEDULER_CAPABILITIES } from "../coordination-scheduler-capabilities.ts";
+import type { CoordinationScheduler } from "../coordination-scheduler-types.ts";
 import type { EventBus } from "../event-bus.ts";
 import type { ExecOptions, ExecResult } from "../exec.ts";
+import type { EXTERNAL_EVENT_CAPABILITIES } from "../external-event-capabilities.ts";
+import type { ExternalEventRefresh } from "../external-event-reconciliation.ts";
 import type { ReadonlyFooterDataProvider } from "../footer-data-provider.ts";
 import type { KeybindingsManager } from "../keybindings.ts";
 import type { McpServerConfig, McpServerRegistry, RegisteredMcpServer } from "../mcp-servers.ts";
 import type { CustomMessage } from "../messages.ts";
 import type { ModelRegistry } from "../model-registry.ts";
 import type { ScopedModel } from "../model-resolver.ts";
+import type { REQUEST_ADMISSION_CAPABILITIES } from "../request-admission-capabilities.ts";
+import type { RequestAdmission } from "../request-admission-types.ts";
+import type { RUNTIME_LIFECYCLE_CAPABILITIES } from "../runtime-lifecycle-capabilities.ts";
+import type { RuntimeLifecycle } from "../runtime-lifecycle-types.ts";
 import type {
 	BranchSummaryEntry,
 	CompactionEntry,
@@ -344,6 +352,10 @@ export interface CompactOptions {
 export type ExtensionMode = "tui" | "rpc" | "json" | "print";
 
 export interface ExtensionContext {
+	/** Admission facade for the current runtime incarnation. */
+	readonly requestAdmission: RequestAdmission;
+	/** Coordination scheduler facade for the current runtime incarnation. */
+	readonly coordinationScheduler: CoordinationScheduler;
 	/** UI methods for user interaction */
 	ui: ExtensionUIContext;
 	/** Current run mode. Use "tui" to guard terminal-only UI such as custom components. */
@@ -1636,6 +1648,14 @@ export type ExtensionHandler<E, R = undefined> = (event: E, ctx: ExtensionContex
  * ExtensionAPI passed to extension factory functions.
  */
 export interface ExtensionAPI {
+	/** Admission facade for the current runtime incarnation. */
+	readonly requestAdmission: RequestAdmission;
+	/** Coordination scheduler facade for the current runtime incarnation. */
+	readonly coordinationScheduler: CoordinationScheduler;
+	readonly externalEventCapabilities: typeof EXTERNAL_EVENT_CAPABILITIES;
+	readonly runtimeLifecycleCapabilities: typeof RUNTIME_LIFECYCLE_CAPABILITIES;
+	readonly requestAdmissionCapabilities: typeof REQUEST_ADMISSION_CAPABILITIES;
+	readonly coordinationSchedulerCapabilities: typeof COORDINATION_SCHEDULER_CAPABILITIES;
 	// =========================================================================
 	// Event Subscription
 	// =========================================================================
@@ -1794,6 +1814,12 @@ export interface ExtensionAPI {
 
 	/** Append a custom entry to the session for state persistence (not sent to LLM). */
 	appendEntry<T = unknown>(customType: string, data?: T): void;
+
+	/** Refresh the view of stored external events without admitting them. */
+	refreshExternalEvents(update?: ExternalEventRefresh): boolean;
+
+	/** Get the lifecycle facade bound to this extension runtime. */
+	getRuntimeLifecycle(): RuntimeLifecycle;
 
 	// =========================================================================
 	// Session Metadata
@@ -2307,11 +2333,19 @@ export interface ExtensionCommandContextActions {
 	reload: () => Promise<void>;
 }
 
+/** Session coordination facades on the shared runtime, bound by ExtensionRunner.bindCoordination(). */
+export interface ExtensionRuntimeCoordination {
+	refreshExternalEvents: (update?: ExternalEventRefresh) => boolean;
+	getRuntimeLifecycle: () => RuntimeLifecycle;
+	getRequestAdmission: () => RequestAdmission;
+	getCoordinationScheduler: () => CoordinationScheduler;
+}
+
 /**
  * Full runtime = state + actions.
  * Created by loader with throwing action stubs, completed by runner.initialize().
  */
-export interface ExtensionRuntime extends ExtensionRuntimeState, ExtensionActions {}
+export interface ExtensionRuntime extends ExtensionRuntimeState, ExtensionActions, ExtensionRuntimeCoordination {}
 
 /** Loaded extension with all registered items. */
 export interface Extension {
