@@ -328,6 +328,10 @@ export class CacheWarmer {
 		}
 
 		run.extensionOverride = extensionOverride;
+		const assertCurrent = () => {
+			if (this.run !== run || run.controller.signal.aborted)
+				throw new Error("Cache warming run is no longer current");
+		};
 		try {
 			const message = await this.models
 				.streamSimple(run.model, run.context, {
@@ -337,6 +341,22 @@ export class CacheWarmer {
 					disableContinuation: true,
 					maxRetries: 0,
 					signal: run.controller.signal,
+					transformHeaders: async (headers) => {
+						assertCurrent();
+						try {
+							return (await run.options.transformHeaders?.(headers)) ?? headers;
+						} finally {
+							assertCurrent();
+						}
+					},
+					onPayload: async (payload, model) => {
+						assertCurrent();
+						try {
+							return await run.options.onPayload?.(payload, model);
+						} finally {
+							assertCurrent();
+						}
+					},
 				})
 				.result();
 			if (!this.validateRun(run)) return;

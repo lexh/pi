@@ -856,9 +856,14 @@ function findProjectedCutPoint(
 	};
 }
 
+export interface CompactionPreparationOptions {
+	firstUnsentEntryId?: string;
+}
+
 export function prepareCompaction(
 	pathEntries: SessionEntry[],
 	settings: CompactionSettings,
+	options?: CompactionPreparationOptions,
 ): CompactionPreparation | undefined {
 	if (pathEntries.length > 0 && pathEntries[pathEntries.length - 1].type === "compaction") {
 		return undefined;
@@ -882,7 +887,22 @@ export function prepareCompaction(
 	}
 	const boundaryEnd = projectedEntries.length;
 	const tokensBefore = estimateProjectedContextTokens(projection, pathEntries).tokens;
-	const cutPoint = findProjectedCutPoint(projectedEntries, boundaryStart, boundaryEnd, settings.keepRecentTokens);
+	let cutPoint = findProjectedCutPoint(projectedEntries, boundaryStart, boundaryEnd, settings.keepRecentTokens);
+	if (options?.firstUnsentEntryId !== undefined) {
+		const unsentIndex = projectedEntries.findIndex((entry) => entry.sourceEntry.id === options.firstUnsentEntryId);
+		if (unsentIndex < boundaryStart) throw new Error("Unsent compaction boundary not found in projected branch");
+		if (cutPoint.firstKeptEntryIndex > unsentIndex) {
+			const startsTurn = isProjectedTurnStart(projectedEntries[unsentIndex]);
+			const turnStartIndex = startsTurn
+				? -1
+				: findProjectedTurnStartIndex(projectedEntries, unsentIndex, boundaryStart);
+			cutPoint = {
+				firstKeptEntryIndex: unsentIndex,
+				turnStartIndex,
+				isSplitTurn: !startsTurn && turnStartIndex !== -1,
+			};
+		}
+	}
 
 	const firstKeptEntry = projectedEntries[cutPoint.firstKeptEntryIndex]?.sourceEntry;
 	if (!firstKeptEntry?.id) return undefined;
