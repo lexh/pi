@@ -158,12 +158,12 @@ describe("cache warming", () => {
 			options: {
 				reasoning: "high",
 				sessionId: "s",
-				transformHeaders,
 				maxTokens: 1,
 				maxRetries: 0,
 				disableContinuation: true,
 			},
 		});
+		expect(await calls[0].options?.transformHeaders?.({})).toEqual(await transformHeaders());
 		expect(calls[0].options?.signal).not.toBe(signal);
 		expect(events[0]).toMatchObject({
 			type: "cache_warming_decision",
