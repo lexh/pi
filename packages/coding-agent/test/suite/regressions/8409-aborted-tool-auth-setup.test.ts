@@ -48,6 +48,7 @@ describe("issue #8409 aborted tool auth setup", () => {
 			.find((message) => message.role === "assistant");
 		expect(finalAssistant?.role).toBe("assistant");
 		if (finalAssistant?.role !== "assistant") throw new Error("Expected final assistant message");
-		expect(finalAssistant.stopReason).toBe("aborted");
+		expect(finalAssistant.stopReason).toBe("toolUse");
+		expect(harness.session.messages.at(-1)?.role).toBe("toolResult");
 	});
 });
