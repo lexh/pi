@@ -16,6 +16,11 @@ import type {
 } from "@earendil-works/pi-ai";
 import type { Static } from "@earendil-works/pi-schema";
 
+/** Additional request ownership check for cooperative stream implementations. */
+export interface AgentStreamOptions extends SimpleStreamOptions {
+	assertRequestCurrent?: () => void;
+}
+
 /**
  * Stream function used by the agent loop. `Models.streamSimple` satisfies
  * this shape.
@@ -33,7 +38,7 @@ import type { Static } from "@earendil-works/pi-schema";
 export type StreamFn = (
 	model: Model<Api>,
 	context: TranscriptContext,
-	options?: SimpleStreamOptions,
+	options?: AgentStreamOptions,
 ) => AssistantMessageEventStream | Promise<AssistantMessageEventStream>;
 
 /**
@@ -177,7 +182,10 @@ export interface PrepareRequestContext {
 }
 
 /** Replacement runtime state for the provider request being prepared. */
-export type AgentRequestUpdate = Omit<AgentLoopTurnUpdate, "messages">;
+export type AgentRequestUpdate = Omit<AgentLoopTurnUpdate, "messages"> & {
+	/** Poll steering once after request preparation if none was selected earlier. */
+	pollSteeringAfterPreparation?: boolean;
+};
 
 /**
  * Called immediately before every conversational provider request, including the first.
@@ -187,6 +195,29 @@ export type PrepareRequest = (
 	request: PrepareRequestContext,
 	signal?: AbortSignal,
 ) => AgentRequestUpdate | void | Promise<AgentRequestUpdate | undefined> | Promise<void>;
+
+/** Transformed agent messages and normalized provider context, after key resolution. */
+export interface FinalizeRequestContext {
+	messages: AgentMessage[];
+	context: TranscriptContext;
+	model: Model<Api>;
+	thinkingLevel: ThinkingLevel;
+}
+
+/** Final provider input, loop history, ownership guards and dispatch settlement. */
+export interface FinalizedRequest {
+	context: TranscriptContext;
+	messages: AgentMessage[];
+	assertCurrent(): void;
+	onAssistantStart(): void;
+	settle(outcome: "cancelled-before-dispatch" | "dispatch-uncertain"): Promise<void>;
+}
+
+/** Finalize a request before dispatch, or leave it unchanged. */
+export type FinalizeRequest = (
+	request: FinalizeRequestContext,
+	signal?: AbortSignal,
+) => Promise<FinalizedRequest | undefined>;
 
 export interface PrepareNextTurnContext extends AgentTurnContext {}
 
@@ -269,6 +300,9 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * replace the runtime values for this and later requests in the run. This hook does not poll queues.
 	 */
 	prepareRequest?: PrepareRequest;
+
+	/** Finalize the normalized request before dispatch. */
+	finalizeRequest?: FinalizeRequest;
 
 	/**
 	 * Called after `turn_end` when the loop will continue, immediately before the next turn starts.
@@ -529,6 +563,7 @@ export type AgentEvent =
 	// Agent lifecycle
 	| { type: "agent_start" }
 	| { type: "agent_end"; messages: AgentMessage[] }
+	| { type: "request_suppressed"; reason: string; errorMessage: string }
 	// Turn lifecycle - a turn is one assistant response + any tool calls/results
 	| { type: "turn_start" }
 	| { type: "turn_end"; message: AgentMessage; toolResults: ToolResultMessage[] }

@@ -12,7 +12,7 @@ import {
 	type Transport,
 	toToolDeclaration,
 } from "@earendil-works/pi-ai";
-import { runAgentLoop, runAgentLoopContinue } from "./agent-loop.ts";
+import { AgentRequestSuppressedError, runAgentLoop, runAgentLoopContinue } from "./agent-loop.ts";
 import { getDefaultStreamFn } from "./stream-fn.ts";
 import type {
 	AfterToolCallContext,
@@ -26,6 +26,7 @@ import type {
 	AgentTool,
 	BeforeToolCallContext,
 	BeforeToolCallResult,
+	FinalizeRequest,
 	FinishTurn,
 	PrepareNextTurnContext,
 	PrepareRequest,
@@ -125,6 +126,7 @@ export interface AgentOptions {
 	afterToolCall?: (context: AfterToolCallContext, signal?: AbortSignal) => Promise<AfterToolCallResult | undefined>;
 	finishTurn?: FinishTurn;
 	prepareRequest?: PrepareRequest;
+	finalizeRequest?: FinalizeRequest;
 	prepareNextTurn?: (
 		signal?: AbortSignal,
 	) => Promise<AgentLoopTurnUpdate | undefined> | AgentLoopTurnUpdate | undefined;
@@ -148,6 +150,7 @@ export interface AgentOptions {
 
 class PendingMessageQueue {
 	private messages: AgentMessage[] = [];
+	private selected: AgentMessage[] = [];
 	public mode: QueueMode;
 
 	constructor(mode: QueueMode) {
@@ -171,11 +174,32 @@ class PendingMessageQueue {
 	drain(): AgentMessage[] {
 		const drained = this.peek();
 		this.messages = this.messages.slice(drained.length);
+		this.selected.push(...drained);
 		return drained;
+	}
+
+	acknowledge(message: AgentMessage): boolean {
+		const index = this.selected.findIndex(
+			(selected) =>
+				selected === message ||
+				(selected.role === "system" &&
+					message.role === "system" &&
+					selected.timestamp === message.timestamp &&
+					selected.content === message.content),
+		);
+		if (index === -1) return false;
+		this.selected.splice(index, 1);
+		return true;
+	}
+
+	restore(): void {
+		this.messages = [...this.selected, ...this.messages];
+		this.selected = [];
 	}
 
 	clear(): void {
 		this.messages = [];
+		this.selected = [];
 	}
 }
 
@@ -214,6 +238,7 @@ export class Agent {
 	) => Promise<AfterToolCallResult | undefined>;
 	public finishTurn?: FinishTurn;
 	public prepareRequest?: PrepareRequest;
+	public finalizeRequest?: FinalizeRequest;
 	public prepareNextTurn?: (
 		signal?: AbortSignal,
 	) => Promise<AgentLoopTurnUpdate | undefined> | AgentLoopTurnUpdate | undefined;
@@ -250,6 +275,7 @@ export class Agent {
 		this.afterToolCall = runtimeOptions.afterToolCall;
 		this.finishTurn = runtimeOptions.finishTurn;
 		this.prepareRequest = runtimeOptions.prepareRequest;
+		this.finalizeRequest = runtimeOptions.finalizeRequest;
 		this.prepareNextTurn = runtimeOptions.prepareNextTurn;
 		this.prepareNextTurnWithContext = runtimeOptions.prepareNextTurnWithContext;
 		this.steeringQueue = new PendingMessageQueue(runtimeOptions.steeringMode ?? "one-at-a-time");
@@ -491,6 +517,7 @@ export class Agent {
 			afterToolCall: this.afterToolCall,
 			finishTurn: this.finishTurn,
 			prepareRequest: this.prepareRequest,
+			finalizeRequest: this.finalizeRequest,
 			prepareNextTurn:
 				this.prepareNextTurnWithContext || this.prepareNextTurn
 					? async (context) => {
@@ -535,11 +562,28 @@ export class Agent {
 		} catch (error) {
 			await this.handleRunFailure(error, abortController.signal.aborted);
 		} finally {
+			this.steeringQueue.restore();
+			this.followUpQueue.restore();
 			this.finishRun();
 		}
 	}
 
 	private async handleRunFailure(error: unknown, aborted: boolean): Promise<void> {
+		try {
+			await this.emitRunFailure(error, aborted);
+		} catch (failure) {
+			// A suppressed failure ends the run with request_suppressed and agent_end instead.
+			if (!(failure instanceof AgentRequestSuppressedError)) throw failure;
+			await this.processEvents({
+				type: "request_suppressed",
+				reason: failure.reason,
+				errorMessage: failure.message,
+			});
+			await this.processEvents({ type: "agent_end", messages: [] });
+		}
+	}
+
+	private async emitRunFailure(error: unknown, aborted: boolean): Promise<void> {
 		const failureMessage = {
 			role: "assistant",
 			content: [{ type: "text", text: "" }],
@@ -585,6 +629,7 @@ export class Agent {
 			case "message_end":
 				this._state.streamingMessage = undefined;
 				this._state.messages.push(event.message);
+				if (!this.steeringQueue.acknowledge(event.message)) this.followUpQueue.acknowledge(event.message);
 				break;
 
 			case "tool_execution_start": {
