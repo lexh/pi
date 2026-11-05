@@ -145,6 +145,8 @@ Treat each custom component instance as belonging to one interaction. Create a n
 
 Finish the interaction with the completion callback supplied to the component factory. It resolves the `ctx.ui.custom()` promise and disposes the component. Do not call `OverlayHandle.hide()` on an overlay created by `ctx.ui.custom()`.
 
+For input observers that see terminal input before overlays and focused components do, and how Escape in an overlay revokes coordination permissions, see [Extension Coordination](coordination-extensions.md#pre-routing-input-observers-and-gate-ownership).
+
 See [`overlay-qa-tests.ts`](../examples/extensions/overlay-qa-tests.ts) for positioning, stacking, focus, responsive visibility, and animation behavior.
 
 ## Apply themes correctly

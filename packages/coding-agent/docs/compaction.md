@@ -22,6 +22,8 @@ Pi has two summarization mechanisms:
 
 Both use closely related structured formats and track file operations cumulatively. Summarization requests disable prompt-cache writes because these one-off prompts are unlikely to be reused.
 
+For how both treat external event records and ordered request admission, see [Coordination in Sessions](coordination-sessions.md#compaction).
+
 ## Compaction
 
 ### When It Triggers

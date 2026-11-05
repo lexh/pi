@@ -130,6 +130,8 @@ In fullscreen mode, these actions control the transcript and take precedence ove
 
 On native Windows, `app.suspend` has no default because Windows terminals do not support Unix job control. If you assign it manually, Pi shows a status message instead of suspending. WSL uses the normal `ctrl+z` and `fg` behavior.
 
+Physical `escape` also cancels coordination permissions before input routing, whatever `app.interrupt` is bound to; see [Extension Coordination](coordination-extensions.md#physical-escape-coordination-cancellation).
+
 ### Sessions
 
 | Keybinding id | Default | Description |

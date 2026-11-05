@@ -1566,6 +1566,8 @@ pi.on("agent_settled", () => {
 
 ## ExtensionAPI Methods
 
+The session coordination members of `pi` and `ctx` (external events, runtime lifecycle, request admission, and the coordination scheduler) are documented in [Extension Coordination](coordination-extensions.md).
+
 ### pi.on(event, handler)
 
 Subscribe to events. Returns an unsubscribe function that removes only that registration. See [Events](#events) for event types and return values.

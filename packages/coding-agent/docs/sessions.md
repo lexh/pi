@@ -49,6 +49,8 @@ When you leave a branch, Pi can summarize it and attach that summary to the bran
 
 For the persisted tree and entry types, see [Session Format](session-format.md).
 
+For how external event records behave in `/tree`, forks, `--continue`, and saved runtime coordination, see [Coordination in Sessions](coordination-sessions.md#sessions-and-branches).
+
 ## Manage conversation context
 
 The model receives the active branch, not every branch in the session file. Pi combines that history with the system prompt, discovered context files, available tools, and loaded skill descriptions. [How Pi Works](how-pi-works.md#context) describes how those inputs are assembled.
