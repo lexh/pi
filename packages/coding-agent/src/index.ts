@@ -12,6 +12,7 @@ export {
 	getReadmePath,
 	VERSION,
 } from "./config.ts";
+export * from "./coordination.ts";
 export {
 	AgentSession,
 	type AgentSessionConfig,

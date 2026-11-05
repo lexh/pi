@@ -2,6 +2,7 @@ import { constants, copyFileSync, existsSync, mkdirSync } from "node:fs";
 import { basename, join, parse } from "node:path";
 import { pathsEqual, resolvePath } from "../utils/paths.ts";
 import type { AgentSession } from "./agent-session.ts";
+import { RuntimeDisposedError, RuntimeReplacementInProgressError } from "./agent-session-coordination.ts";
 import type { AgentSessionRuntimeDiagnostic, AgentSessionServices } from "./agent-session-services.ts";
 import type {
 	ProjectTrustContext,
@@ -9,7 +10,6 @@ import type {
 	SessionShutdownEvent,
 	SessionStartEvent,
 } from "./extensions/index.ts";
-import { emitSessionShutdownEvent } from "./extensions/runner.ts";
 import type { CreateAgentSessionResult } from "./sdk.ts";
 import { assertSessionCwdExists } from "./session-cwd.ts";
 import { SessionManager } from "./session-manager.ts";
@@ -79,6 +79,19 @@ export class AgentSessionRuntime {
 	private readonly createRuntime: CreateAgentSessionRuntimeFactory;
 	private _diagnostics: AgentSessionRuntimeDiagnostic[];
 	private _modelFallbackMessage?: string;
+	private replacementInProgress = false;
+	private disposed = false;
+	private cleanup?: Promise<void>;
+	private teardown?: { session: AgentSession; promise: Promise<void> };
+	private candidate?: AgentSession;
+	private afterReplacement?: () => Promise<void>;
+	/**
+	 * When set, newSession, fork, switchSession and importFromJsonl refused because another
+	 * replacement is in progress call this and resolve { cancelled: true } instead of rejecting with
+	 * RuntimeReplacementInProgressError. Interactive mode sets it to report the refusal as a status.
+	 * reload() always rejects: it has no cancelled result.
+	 */
+	onReplacementRefused?: () => void;
 
 	constructor(
 		_session: AgentSession,
@@ -144,6 +157,7 @@ export class AgentSessionRuntime {
 			reason,
 			targetSessionFile,
 		});
+		this.assertActive(this.session);
 		return { cancelled: result?.cancel === true };
 	}
 
@@ -161,20 +175,111 @@ export class AgentSessionRuntime {
 			entryId,
 			...options,
 		});
+		this.assertActive(this.session);
 		return { cancelled: result?.cancel === true };
+	}
+
+	get isReplacementInProgress(): boolean {
+		return this.replacementInProgress;
+	}
+
+	private assertActive(session?: AgentSession): void {
+		if (this.disposed || session?.isDisposed) throw new RuntimeDisposedError();
+	}
+
+	/**
+	 * Run a replacement under this runtime's fence and the outgoing session's. Refused while either is
+	 * held. The withSession callback recorded by finishSessionReplacement runs after both release.
+	 */
+	private async replace<T extends { cancelled: boolean }>(operation: () => Promise<T>): Promise<T> {
+		this.assertActive();
+		if (this.replacementInProgress) return this.refuseReplacement<T>();
+		this.assertActive(this._session);
+		if (this._session.isReplacementInProgress) return this.refuseReplacement<T>();
+		this.replacementInProgress = true;
+		const outgoing = this._session;
+		let result: T;
+		let afterReplacement: (() => Promise<void>) | undefined;
+		try {
+			result = await outgoing.withRuntimeReplacement(operation);
+			afterReplacement = this.afterReplacement;
+		} finally {
+			this.afterReplacement = undefined;
+			this.replacementInProgress = false;
+		}
+		await afterReplacement?.();
+		return result;
+	}
+
+	private refuseReplacement<T extends { cancelled: boolean }>(): T {
+		if (!this.onReplacementRefused) throw new RuntimeReplacementInProgressError();
+		this.onReplacementRefused();
+		return { cancelled: true } as T;
+	}
+
+	/** Retire, settle, shut down, invalidate and dispose a session once; disposal and a replacement share it. */
+	private teardownSession(
+		outgoing: AgentSession,
+		reason: SessionShutdownEvent["reason"],
+		targetSessionFile?: string,
+	): Promise<void> {
+		if (this.teardown?.session === outgoing) return this.teardown.promise;
+		const completion = Promise.withResolvers<void>();
+		this.teardown = { session: outgoing, promise: completion.promise };
+		void (async () => {
+			try {
+				outgoing.retireRuntime(reason);
+				await outgoing.abort();
+				await outgoing.shutdownRuntime(reason, targetSessionFile);
+			} finally {
+				try {
+					this.beforeSessionInvalidate?.();
+				} finally {
+					outgoing.dispose();
+				}
+			}
+		})().then(completion.resolve, completion.reject);
+		return completion.promise;
+	}
+
+	/**
+	 * Apply a created runtime under the candidate's replacement fence. newSession's setup runs before the
+	 * candidate becomes current, rebind after. A candidate that fails or loses to dispose() is disposed.
+	 */
+	private async applyCandidate(
+		result: CreateAgentSessionRuntimeResult,
+		setup?: (sessionManager: SessionManager) => Promise<void>,
+	): Promise<void> {
+		const next = result.session;
+		this.candidate = next;
+		try {
+			this.assertActive();
+			await next.withRuntimeReplacement(async () => {
+				this.assertActive(next);
+				if (setup) {
+					await setup(next.sessionManager);
+					this.assertActive(next);
+					next.refreshContext();
+				}
+				this.apply(result);
+				if (this.rebindSession) {
+					await this.rebindSession(next);
+					this.assertActive(next);
+				}
+			});
+		} catch (error) {
+			next.dispose();
+			throw error;
+		} finally {
+			if (this.candidate === next) this.candidate = undefined;
+		}
 	}
 
 	private async teardownCurrent(reason: SessionShutdownEvent["reason"], targetSessionFile?: string): Promise<void> {
 		// Settle any active response first so the aborted turn (including tool
 		// results) is persisted to the outgoing session before it is replaced.
-		await this.session.abort();
-		await emitSessionShutdownEvent(this.session.extensionRunner, {
-			type: "session_shutdown",
-			reason,
-			targetSessionFile,
-		});
-		this.beforeSessionInvalidate?.();
-		this.session.dispose();
+		await this.teardownSession(this.session, reason, targetSessionFile);
+		this.assertActive();
 	}
 
 	private apply(result: CreateAgentSessionRuntimeResult): void {
@@ -185,12 +290,12 @@ export class AgentSessionRuntime {
 	}
 
 	private async finishSessionReplacement(withSession?: (ctx: ReplacedSessionContext) => Promise<void>): Promise<void> {
-		if (this.rebindSession) {
-			await this.rebindSession(this.session);
-		}
-		if (withSession) {
-			await withSession(this.session.createReplacedSessionContext());
-		}
+		// applyCandidate rebound the session under its fence; withSession runs once replace() releases the fences.
+		const session = this.session;
+		this.afterReplacement = async () => {
+			this.assertActive(session);
+			if (withSession) await withSession(session.createReplacedSessionContext());
+		};
 	}
 
 	async switchSession(
@@ -201,16 +306,24 @@ export class AgentSessionRuntime {
 			projectTrustContextFactory?: (cwd: string) => ProjectTrustContext;
 		},
 	): Promise<{ cancelled: boolean }> {
+		return this.replace(() => this.switchSessionUnfenced(sessionPath, options));
+	}
+
+	private async switchSessionUnfenced(
+		sessionPath: string,
+		options?: Parameters<AgentSessionRuntime["switchSession"]>[1],
+	): Promise<{ cancelled: boolean }> {
 		const beforeResult = await this.emitBeforeSwitch("resume", sessionPath);
 		if (beforeResult.cancelled) {
 			return beforeResult;
 		}
 
 		const previousSessionFile = this.session.sessionFile;
+		if (!existsSync(resolvePath(sessionPath))) throw new Error(`Session file not found: ${sessionPath}`);
 		const sessionManager = SessionManager.open(sessionPath, undefined, options?.cwdOverride);
 		assertSessionCwdExists(sessionManager, this.cwd);
 		await this.teardownCurrent("resume", sessionManager.getSessionFile());
-		this.apply(
+		await this.applyCandidate(
 			await this.createRuntime({
 				cwd: sessionManager.getCwd(),
 				agentDir: this.services.agentDir,
@@ -228,6 +341,12 @@ export class AgentSessionRuntime {
 		setup?: (sessionManager: SessionManager) => Promise<void>;
 		withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
 	}): Promise<{ cancelled: boolean }> {
+		return this.replace(() => this.newSessionUnfenced(options));
+	}
+
+	private async newSessionUnfenced(
+		options?: Parameters<AgentSessionRuntime["newSession"]>[0],
+	): Promise<{ cancelled: boolean }> {
 		const beforeResult = await this.emitBeforeSwitch("new");
 		if (beforeResult.cancelled) {
 			return beforeResult;
@@ -243,18 +362,15 @@ export class AgentSessionRuntime {
 		}
 
 		await this.teardownCurrent("new", sessionManager.getSessionFile());
-		this.apply(
+		await this.applyCandidate(
 			await this.createRuntime({
 				cwd: this.cwd,
 				agentDir: this.services.agentDir,
 				sessionManager,
 				sessionStartEvent: { type: "session_start", reason: "new", previousSessionFile },
 			}),
+			options?.setup,
 		);
-		if (options?.setup) {
-			await options.setup(this.session.sessionManager);
-			this.session.refreshContext();
-		}
 		await this.finishSessionReplacement(options?.withSession);
 		return { cancelled: false };
 	}
@@ -262,6 +378,13 @@ export class AgentSessionRuntime {
 	async fork(
 		entryId: string,
 		options?: { position?: "before" | "at"; withSession?: (ctx: ReplacedSessionContext) => Promise<void> },
+	): Promise<{ cancelled: boolean; selectedText?: string }> {
+		return this.replace(() => this.forkUnfenced(entryId, options));
+	}
+
+	private async forkUnfenced(
+		entryId: string,
+		options?: Parameters<AgentSessionRuntime["fork"]>[1],
 	): Promise<{ cancelled: boolean; selectedText?: string }> {
 		const position = options?.position ?? "before";
 		const beforeResult = await this.emitBeforeFork(entryId, { position });
@@ -297,7 +420,7 @@ export class AgentSessionRuntime {
 				const sessionManager = SessionManager.create(this.cwd, sessionDir);
 				sessionManager.newSession({ parentSession: currentSessionFile });
 				await this.teardownCurrent("fork", sessionManager.getSessionFile());
-				this.apply(
+				await this.applyCandidate(
 					await this.createRuntime({
 						cwd: this.cwd,
 						agentDir: this.services.agentDir,
@@ -318,7 +441,7 @@ export class AgentSessionRuntime {
 				throw new Error("Failed to create forked session");
 			}
 			await this.teardownCurrent("fork", sessionManager.getSessionFile());
-			this.apply(
+			await this.applyCandidate(
 				await this.createRuntime({
 					cwd: sessionManager.getCwd(),
 					agentDir: this.services.agentDir,
@@ -337,7 +460,7 @@ export class AgentSessionRuntime {
 		} else {
 			sessionManager.createBranchedSession(targetLeafId);
 		}
-		this.apply(
+		await this.applyCandidate(
 			await this.createRuntime({
 				cwd: this.cwd,
 				agentDir: this.services.agentDir,
@@ -357,6 +480,10 @@ export class AgentSessionRuntime {
 	 * @throws {MissingSessionCwdError} When the imported session cwd cannot be resolved and no override is provided.
 	 */
 	async importFromJsonl(inputPath: string, cwdOverride?: string): Promise<{ cancelled: boolean }> {
+		return this.replace(() => this.importFromJsonlUnfenced(inputPath, cwdOverride));
+	}
+
+	private async importFromJsonlUnfenced(inputPath: string, cwdOverride?: string): Promise<{ cancelled: boolean }> {
 		const resolvedPath = resolvePath(inputPath);
 		if (!existsSync(resolvedPath)) {
 			throw new SessionImportFileNotFoundError(resolvedPath);
@@ -389,7 +516,7 @@ export class AgentSessionRuntime {
 		const sessionManager = SessionManager.open(destinationPath, sessionDir, cwdOverride);
 		assertSessionCwdExists(sessionManager, this.cwd);
 		await this.teardownCurrent("resume", sessionManager.getSessionFile());
-		this.apply(
+		await this.applyCandidate(
 			await this.createRuntime({
 				cwd: sessionManager.getCwd(),
 				agentDir: this.services.agentDir,
@@ -401,20 +528,38 @@ export class AgentSessionRuntime {
 		return { cancelled: false };
 	}
 
+	async reload(options?: {
+		beforeReload?: () => void | Promise<void>;
+		beforeSessionStart?: () => void | Promise<void>;
+	}): Promise<void> {
+		this.assertActive();
+		if (this.replacementInProgress) throw new RuntimeReplacementInProgressError();
+		this.assertActive(this.session);
+		this.replacementInProgress = true;
+		const session = this.session;
+		try {
+			await session.reload({ ...options, assertActive: () => this.assertActive(session) });
+			this.assertActive(session);
+		} finally {
+			this.replacementInProgress = false;
+		}
+	}
+
 	/**
 	 * Dispose the session for process exit. Also waits for credential writes in progress: an OAuth
 	 * refresh may already have spent the old single-use refresh token, so exiting before the new one
 	 * is saved would lose the login (#11692).
 	 */
-	async dispose(): Promise<void> {
-		await this.session.abort();
-		await emitSessionShutdownEvent(this.session.extensionRunner, {
-			type: "session_shutdown",
-			reason: "quit",
-		});
-		this.beforeSessionInvalidate?.();
-		this.session.dispose();
-		await this.services.modelRuntime.settleCredentialWrites();
+	dispose(): Promise<void> {
+		if (this.cleanup) return this.cleanup;
+		this.disposed = true;
+		const session = this.session;
+		session.markRuntimeUnavailable();
+		if (this.candidate && this.candidate !== session) this.candidate.dispose();
+		this.cleanup = this.teardownSession(session, "quit").then(() =>
+			this.services.modelRuntime.settleCredentialWrites(),
+		);
+		return this.cleanup;
 	}
 }
 
