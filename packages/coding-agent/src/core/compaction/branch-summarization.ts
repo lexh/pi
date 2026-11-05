@@ -20,6 +20,7 @@ import {
 	projectContextEntry,
 	type ReadonlySessionManager,
 	type SessionEntry,
+	sessionEntryToContextMessages,
 } from "../session-manager.ts";
 import { completeSummarization, estimateTokens, getSummarizationFailure } from "./compaction.ts";
 import {
@@ -177,10 +178,12 @@ function getMessageFromEntry(entry: SessionEntry, edit?: ContextEditEntry): Agen
 		case "compaction":
 			return createCompactionSummaryMessage(entry.summary, entry.tokensBefore, entry.timestamp);
 
+		case "custom":
+			return sessionEntryToContextMessages(entry)[0];
+
 		// These don't contribute to conversation content
 		case "thinking_level_change":
 		case "model_change":
-		case "custom":
 		case "label":
 		case "session_info":
 			return undefined;
