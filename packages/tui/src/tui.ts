@@ -147,6 +147,10 @@ export interface Component {
 	invalidate(): void;
 }
 
+/** Non-consuming pre-routing terminal input observer. */
+export type TuiInputObserver = (data: string) => void;
+/** Observers belong to the terminal, so they keep observing when another TUI takes it over. */
+const terminalInputObservers = new WeakMap<Terminal, Set<TuiInputObserver>>();
 export type TuiInputListenerResult = { consume?: boolean; data?: string } | undefined;
 export type TuiInputListener = (data: string) => TuiInputListenerResult;
 type PendingTerminalColorQuery = {
@@ -488,6 +492,10 @@ export interface TUI extends Component {
 	stop(options?: TuiStopOptions): void;
 	renderNow(force?: boolean): void;
 	requestRender(force?: boolean): void;
+	/** Register a non-consuming pre-routing terminal input observer. */
+	addInputObserver(observer: TuiInputObserver): () => void;
+	/** Remove a previously registered terminal input observer. */
+	removeInputObserver(observer: TuiInputObserver): void;
 	addInputListener(listener: TuiInputListener): () => void;
 	removeInputListener(listener: TuiInputListener): void;
 	onTerminalColorSchemeChange(listener: (scheme: TerminalColorScheme) => void): () => void;
@@ -971,6 +979,22 @@ export abstract class TuiBase extends Container implements TUI {
 		this.requestRender();
 	}
 
+	/** Register a non-consuming pre-routing input observer on this TUI's terminal. */
+	addInputObserver(observer: TuiInputObserver): () => void {
+		let observers = terminalInputObservers.get(this.terminal);
+		if (!observers) {
+			observers = new Set();
+			terminalInputObservers.set(this.terminal, observers);
+		}
+		observers.add(observer);
+		return () => this.removeInputObserver(observer);
+	}
+
+	/** Remove a previously registered terminal input observer. */
+	removeInputObserver(observer: TuiInputObserver): void {
+		terminalInputObservers.get(this.terminal)?.delete(observer);
+	}
+
 	addInputListener(listener: TuiInputListener): () => void {
 		this.inputListeners.add(listener);
 		return () => {
@@ -1090,6 +1114,10 @@ export abstract class TuiBase extends Container implements TUI {
 		}
 		if (this.consumeTerminalColorSchemeReport(data)) {
 			return;
+		}
+
+		for (const observer of [...(terminalInputObservers.get(this.terminal) ?? [])]) {
+			observer(data);
 		}
 
 		if (this.inputListeners.size > 0) {
