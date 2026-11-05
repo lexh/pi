@@ -186,6 +186,7 @@ import { TrustSelectorComponent } from "./components/trust-selector.ts";
 import { UserMessageComponent } from "./components/user-message.ts";
 import { UserMessageSelectorComponent } from "./components/user-message-selector.ts";
 import { editInExternalEditor } from "./external-editor.ts";
+import { InteractiveCoordination } from "./interactive-coordination.ts";
 import { refreshModelCatalogs } from "./model-catalog-refresh.ts";
 import { getModelSearchText } from "./model-search.ts";
 import { type BlockedStatus, ProgramStatusReporter } from "./program-status-reporter.ts";
@@ -522,6 +523,17 @@ export class InteractiveMode {
 
 	// Tool execution tracking: toolCallId -> component
 	private pendingTools = new Map<string, ToolExecutionComponent>();
+	// Session coordination. Hooks use ?. because prototype-built test doubles have none.
+	private readonly coordination = new InteractiveCoordination({
+		runtimeHost: () => this.runtimeHost,
+		ui: () => this.ui,
+		chat: () => this.chatContainer,
+		outputPad: () => this.outputPad,
+		toolOutputExpanded: () => this.toolOutputExpanded,
+		showStatus: (message) => this.showStatus(message),
+		showError: (message) => this.showError(message),
+		invalidateFooter: () => this.footer.invalidate(),
+	});
 
 	// Tool output expansion state
 	private toolOutputExpanded = false;
@@ -651,6 +663,7 @@ export class InteractiveMode {
 			fullscreenWheelScrollLines: this.settingsManager.getFullscreenWheelScrollLines(),
 		});
 		this.ui = createInteractiveTuiReference(() => this.renderer);
+		this.coordination.attach();
 		this.ui.setClearOnShrink(this.settingsManager.getClearOnShrink());
 		this.headerContainer = new Container();
 		this.loadedResourcesContainer = new Container();
@@ -2377,7 +2390,15 @@ export class InteractiveMode {
 
 		// Create a context for shortcut handlers
 		const createContext = (): ExtensionContext => ({
-			ui: this.createExtensionUIContext(),
+			get requestAdmission() {
+				return extensionRunner.createContext().requestAdmission;
+			},
+			get coordinationScheduler() {
+				return extensionRunner.createContext().coordinationScheduler;
+			},
+			get ui() {
+				return extensionRunner.createCommandContext().ui;
+			},
 			mode: "tui",
 			hasUI: true,
 			cwd: this.sessionManager.getCwd(),
@@ -3315,6 +3336,7 @@ export class InteractiveMode {
 		this.defaultEditor.onSubmit = async (text: string) => {
 			text = text.trim();
 			if (!text) return;
+			if (this.coordination?.refuseReplacementCommand(text)) return;
 
 			// Handle commands
 			if (text === "/settings") {
@@ -3525,6 +3547,7 @@ export class InteractiveMode {
 
 		this.footer.invalidate();
 		this.programStatus.handleEvent(event);
+		this.coordination?.observe(event);
 
 		switch (event.type) {
 			case "agent_start":
@@ -3971,6 +3994,7 @@ export class InteractiveMode {
 	}
 
 	private addCustomEntryToChat(entry: Extract<SessionEntry, { type: "custom" }>): void {
+		if (this.coordination?.renderCustomEntry(entry)) return;
 		const renderer = this.session.extensionRunner.getEntryRenderer(entry.customType);
 		if (!renderer) {
 			return;
@@ -4155,6 +4179,7 @@ export class InteractiveMode {
 		}
 
 		for (const item of items) {
+			this.coordination?.beginItem(item, messageMeta);
 			if (isCustomSessionEntry(item)) {
 				this.addCustomEntryToChat(item);
 				continue;
@@ -4237,6 +4262,7 @@ export class InteractiveMode {
 		for (const [toolCallId, component] of renderedPendingTools) {
 			this.pendingTools.set(toolCallId, component);
 		}
+		this.coordination?.endItems(this.pendingTools);
 		this.ui.requestRender();
 	}
 
@@ -4253,7 +4279,7 @@ export class InteractiveMode {
 		// Selection coordinates point into the transcript being replaced (#9311).
 		if (this.renderer instanceof TuiAltScreen) this.renderer.resetTextSelection();
 		const messageMeta = new Map<AgentMessage, { id: string; timestamp: string }>();
-		const items = entries.flatMap((entry): RenderSessionItem[] => {
+		const items = (this.coordination?.project(entries) ?? entries).flatMap((entry): RenderSessionItem[] => {
 			if (entry.type === "custom" || (entry.type === "usage" && entry.kind === "cache_warm")) {
 				return [entry];
 			}
