@@ -4,6 +4,8 @@ import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "..
 
 function createContext(tokens: number | null, compact = vi.fn()): ExtensionContext {
 	return {
+		requestAdmission: {} as ExtensionContext["requestAdmission"],
+		coordinationScheduler: {} as ExtensionContext["coordinationScheduler"],
 		mode: "print",
 		hasUI: false,
 		ui: {} as ExtensionContext["ui"],
