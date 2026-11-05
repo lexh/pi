@@ -34,6 +34,210 @@ import type {
 
 export type AgentEventSink = (event: AgentEvent) => Promise<void> | void;
 
+/** A request stopped before an owned assistant response can be emitted. */
+export class AgentRequestSuppressedError extends Error {
+	readonly reason: string;
+	constructor(reason: string, message: string) {
+		super(message);
+		this.name = "AgentRequestSuppressedError";
+		this.reason = reason;
+	}
+}
+
+function throwIfRequestAborted(signal?: AbortSignal): void {
+	if (signal?.aborted) {
+		throw new AgentRequestSuppressedError("cancelled", "Request cancelled before an owned assistant response");
+	}
+}
+
+async function awaitPreparation<T>(action: () => T | Promise<T>, signal?: AbortSignal): Promise<T> {
+	try {
+		const result = await action();
+		throwIfRequestAborted(signal);
+		return result;
+	} catch (error) {
+		throwIfRequestAborted(signal);
+		throw error;
+	}
+}
+
+/**
+ * The loop config with its preparation hooks guarded: a hook does not start once the request is
+ * aborted, and an abort while it runs suppresses the request even when the hook then fails.
+ */
+function guardPreparation(config: AgentLoopConfig, signal: AbortSignal | undefined): AgentLoopConfig {
+	const guard = <F extends (...args: any[]) => any>(hook: F | undefined): F | undefined =>
+		hook &&
+		(((...args: Parameters<F>) => {
+			throwIfRequestAborted(signal);
+			return awaitPreparation(() => hook(...args), signal);
+		}) as F);
+	return {
+		...config,
+		transformContext: guard(config.transformContext),
+		convertToLlm: guard(config.convertToLlm)!,
+		getApiKey: guard(config.getApiKey),
+		prepareRequest: guard(config.prepareRequest),
+		prepareNextTurn: guard(config.prepareNextTurn),
+		getSteeringMessages: guard(config.getSteeringMessages),
+		getFollowUpMessages: guard(config.getFollowUpMessages),
+	};
+}
+
+/** Run the loop with guarded preparation. A suppressed request ends the run with request_suppressed and agent_end. */
+async function runWithSuppression(
+	context: AgentContext,
+	messages: AgentMessage[],
+	config: AgentLoopConfig,
+	signal: AbortSignal | undefined,
+	emit: AgentEventSink,
+	streamFn: StreamFn,
+): Promise<void> {
+	try {
+		await runLoop(context, messages, guardPreparation(config, signal), signal, emit, streamFn);
+	} catch (error) {
+		if (!(error instanceof AgentRequestSuppressedError)) throw error;
+		await emit({ type: "request_suppressed", reason: error.reason, errorMessage: error.message });
+		await emit({ type: "agent_end", messages });
+	}
+}
+
+/** The agent loop's event stream: result() rejects when the loop fails. */
+class AgentEventStream extends EventStream<AgentEvent, AgentMessage[]> {
+	private readonly failure = Promise.withResolvers<never>();
+
+	fail(error: unknown): void {
+		void this.failure.promise.catch(() => {});
+		this.failure.reject(error);
+		this.end();
+	}
+
+	override result(): Promise<AgentMessage[]> {
+		return Promise.race([super.result(), this.failure.promise]);
+	}
+}
+
+/** The part of a stream function's response that streamAssistantResponse reads. */
+type AssistantResponse = Pick<Awaited<ReturnType<StreamFn>>, typeof Symbol.asyncIterator | "result">;
+
+/** A stream function as streamAssistantResponse calls it. */
+type AssistantStreamFn = (...args: Parameters<StreamFn>) => AssistantResponse | Promise<AssistantResponse>;
+
+/**
+ * Dispatch a request through the config's finalizeRequest. The finalized context and history are
+ * sent, the request must stay current through payload and stream, the first response event adopts
+ * the assistant message, and the request settles once the response ends. Without a finalizer the
+ * request is dispatched unchanged unless it was aborted.
+ */
+async function dispatchFinalized(
+	config: AgentLoopConfig,
+	context: AgentContext,
+	messages: AgentMessage[],
+	llmContext: ReturnType<typeof normalizeContext>,
+	signal: AbortSignal | undefined,
+	streamFunction: StreamFn,
+	dispatch: (
+		streamFunction: AssistantStreamFn,
+		llmContext: ReturnType<typeof normalizeContext>,
+	) => Promise<AssistantMessage>,
+): Promise<AssistantMessage> {
+	throwIfRequestAborted(signal);
+	const finalized = await config
+		.finalizeRequest?.(
+			{
+				messages,
+				context: llmContext,
+				model: config.model,
+				thinkingLevel: config.reasoning ?? "off",
+			},
+			signal,
+		)
+		.catch((error: unknown) => {
+			throwIfRequestAborted(signal);
+			throw error;
+		});
+	if (!finalized) {
+		throwIfRequestAborted(signal);
+		return dispatch(streamFunction, llmContext);
+	}
+	let dispatchStarted = false;
+	let assistantStarted = false;
+	let suppression: AgentRequestSuppressedError | undefined;
+	const guard = () => {
+		try {
+			throwIfRequestAborted(signal);
+			finalized.assertCurrent();
+		} catch (error) {
+			if (error instanceof AgentRequestSuppressedError) suppression = error;
+			throw error;
+		}
+	};
+	const start = () => {
+		if (assistantStarted) return;
+		if (suppression) throw suppression;
+		guard();
+		finalized.onAssistantStart();
+		assistantStarted = true;
+	};
+	try {
+		return await dispatch(async (model, finalContext, options) => {
+			guard();
+			context.messages = finalized.messages;
+			dispatchStarted = true;
+			const response = await awaitPreparation(
+				() =>
+					streamFunction(model, finalContext, {
+						...options,
+						assertRequestCurrent: guard,
+						onPayload: async (payload, payloadModel) => {
+							try {
+								guard();
+								const before = JSON.stringify(payload);
+								const result = await options?.onPayload?.(payload, payloadModel);
+								guard();
+								if (
+									JSON.stringify(result === undefined ? payload : result) !== before ||
+									JSON.stringify(payload) !== before
+								) {
+									throw new AgentRequestSuppressedError(
+										"payload-mutated",
+										"Finalized request payload was changed",
+									);
+								}
+								return result;
+							} catch (error) {
+								if (signal?.aborted) guard();
+								if (error instanceof AgentRequestSuppressedError) suppression = error;
+								throw error;
+							}
+						},
+					}),
+				signal,
+			);
+			guard();
+			return {
+				async *[Symbol.asyncIterator]() {
+					for await (const event of response) {
+						if (suppression) throw suppression;
+						if (event.type === "start") start();
+						yield event;
+					}
+				},
+				async result() {
+					const message = await response.result();
+					start();
+					return message;
+				},
+			};
+		}, finalized.context);
+	} catch (error) {
+		if (!(error instanceof AgentRequestSuppressedError)) guard();
+		throw error;
+	} finally {
+		await finalized.settle(dispatchStarted ? "dispatch-uncertain" : "cancelled-before-dispatch");
+	}
+}
+
 /**
  * Request identity of agent loops: pi-ai's defaults with provider attribution to pi. `AgentLoopConfig.identity`
  * overrides it field by field.
@@ -62,9 +266,10 @@ export function agentLoop(
 		},
 		signal,
 		streamFn,
-	).then((messages) => {
-		stream.end(messages);
-	});
+	).then(
+		(messages) => stream.end(messages),
+		(error: unknown) => stream.fail(error),
+	);
 
 	return stream;
 }
@@ -101,9 +306,10 @@ export function agentLoopContinue(
 		},
 		signal,
 		streamFn,
-	).then((messages) => {
-		stream.end(messages);
-	});
+	).then(
+		(messages) => stream.end(messages),
+		(error: unknown) => stream.fail(error),
+	);
 
 	return stream;
 }
@@ -130,7 +336,7 @@ export async function runAgentLoop(
 		await emit({ type: "message_end", message });
 	}
 
-	await runLoop(currentContext, newMessages, config, signal, emit, streamFn ?? getDefaultStreamFn());
+	await runWithSuppression(currentContext, newMessages, config, signal, emit, streamFn ?? getDefaultStreamFn());
 	return newMessages;
 }
 
@@ -155,12 +361,12 @@ export async function runAgentLoopContinue(
 	await emit({ type: "agent_start" });
 	await emit({ type: "turn_start" });
 
-	await runLoop(currentContext, newMessages, config, signal, emit, streamFn ?? getDefaultStreamFn());
+	await runWithSuppression(currentContext, newMessages, config, signal, emit, streamFn ?? getDefaultStreamFn());
 	return newMessages;
 }
 
-function createAgentStream(): EventStream<AgentEvent, AgentMessage[]> {
-	return new EventStream<AgentEvent, AgentMessage[]>(
+function createAgentStream(): AgentEventStream {
+	return new AgentEventStream(
 		(event: AgentEvent) => event.type === "agent_end",
 		(event: AgentEvent) => (event.type === "agent_end" ? event.messages : []),
 	);
@@ -191,8 +397,10 @@ async function runLoop(
 		// Inner loop: process tool calls and steering messages
 		while (hasMoreToolCalls || pendingMessages.length > 0) {
 			let preparedMessages: AgentMessage[] = [];
+			throwIfRequestAborted(signal);
 			if (lastCompletedTurn) {
 				const nextTurnSnapshot = await config.prepareNextTurn?.(lastCompletedTurn);
+				throwIfRequestAborted(signal);
 				if (nextTurnSnapshot) {
 					currentContext = nextTurnSnapshot.context ?? currentContext;
 					preparedMessages = nextTurnSnapshot.messages ?? [];
@@ -212,16 +420,20 @@ async function runLoop(
 				// otherwise one-at-a-time mode would deliver two messages in this turn.
 				if (pendingMessages.length === 0) {
 					pendingMessages = (await config.getSteeringMessages?.()) || [];
+					throwIfRequestAborted(signal);
 				}
 				await emit({ type: "turn_start" });
+				throwIfRequestAborted(signal);
 			}
 
 			// Process prepared and queued messages before the next assistant response.
+			const selectedSteering = pendingMessages.length > 0;
 			for (const message of declareToolChanges(currentContext, [...preparedMessages, ...pendingMessages])) {
 				await emit({ type: "message_start", message });
 				await emit({ type: "message_end", message });
 				currentContext.messages.push(message);
 				newMessages.push(message);
+				throwIfRequestAborted(signal);
 			}
 			pendingMessages = [];
 
@@ -245,6 +457,17 @@ async function runLoop(
 								? undefined
 								: requestUpdate.thinkingLevel,
 				};
+			}
+			if (requestUpdate?.pollSteeringAfterPreparation && !selectedSteering) {
+				const late = (await config.getSteeringMessages?.()) || [];
+				throwIfRequestAborted(signal);
+				for (const message of late) {
+					await emit({ type: "message_start", message });
+					await emit({ type: "message_end", message });
+					currentContext.messages.push(message);
+					newMessages.push(message);
+					throwIfRequestAborted(signal);
+				}
 			}
 
 			// Stream assistant response
@@ -309,6 +532,7 @@ async function runLoop(
 
 		// Agent would stop here. Check for follow-up messages.
 		const followUpMessages = (await config.getFollowUpMessages?.()) || [];
+		throwIfRequestAborted(signal);
 		if (followUpMessages.length > 0) {
 			// Set as pending so inner loop processes them
 			explicitContinuation = false;
@@ -409,6 +633,21 @@ async function streamAssistantResponse(
 	const resolvedApiKey =
 		(config.getApiKey ? await config.getApiKey(config.model.provider) : undefined) || config.apiKey;
 
+	return dispatchFinalized(config, context, messages, llmContext, signal, streamFunction, (dispatchFn, finalContext) =>
+		streamDispatchedResponse(context, config, signal, emit, dispatchFn, finalContext, resolvedApiKey),
+	);
+}
+
+/** Send the provider request and stream the response, with the stream function and context dispatchFinalized passes. */
+async function streamDispatchedResponse(
+	context: AgentContext,
+	config: AgentLoopConfig,
+	signal: AbortSignal | undefined,
+	emit: AgentEventSink,
+	streamFunction: AssistantStreamFn,
+	llmContext: ReturnType<typeof normalizeContext>,
+	resolvedApiKey: string | undefined,
+): Promise<AssistantMessage> {
 	const response = await streamFunction(config.model, llmContext, {
 		...config,
 		apiKey: resolvedApiKey,
@@ -581,10 +820,6 @@ async function executeToolCallsSequential(
 		await emitToolResultMessage(toolResultMessage, emit);
 		finalizedCalls.push(finalized);
 		messages.push(toolResultMessage);
-
-		if (signal?.aborted) {
-			break;
-		}
 	}
 
 	return {
@@ -620,9 +855,6 @@ async function executeToolCallsParallel(
 			} satisfies FinalizedToolCallOutcome;
 			await emitToolExecutionEnd(finalized, emit);
 			finalizedCalls.push(finalized);
-			if (signal?.aborted) {
-				break;
-			}
 			continue;
 		}
 
@@ -648,9 +880,6 @@ async function executeToolCallsParallel(
 			await emitToolExecutionEnd(finalized, emit);
 			return finalized;
 		});
-		if (signal?.aborted) {
-			break;
-		}
 	}
 
 	const orderedFinalizedCalls = await Promise.all(
@@ -733,6 +962,9 @@ async function prepareToolCall(
 	}
 
 	try {
+		if (signal?.aborted) {
+			return { kind: "immediate", result: createErrorToolResult("Operation aborted"), isError: true };
+		}
 		const preparedToolCall = prepareToolCallArguments(tool, toolCall);
 		const validatedArgs = validateToolArguments(tool, preparedToolCall);
 		if (config.beforeToolCall) {
