@@ -4,6 +4,8 @@ Sessions are stored as JSONL (JSON Lines) files. Each line is a JSON object with
 
 For programmatic creation, persistence, and tree navigation, see the [`SessionManager` API](sdk.md#sessionmanager-api).
 
+For the reserved records that session coordination writes, see [Coordination in Sessions](coordination-sessions.md#durable-external-records-opt-in).
+
 
 ## File Location
 

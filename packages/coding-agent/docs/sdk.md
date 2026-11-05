@@ -59,6 +59,8 @@ See the checked [sessions example](../examples/sdk/11-sessions.ts) for creating,
 
 After a runtime replacement, subscriptions belong to the old `AgentSession` and must be rebound. See the [session runtime example](../examples/sdk/13-session-runtime.ts).
 
+For durable records, external events, runtime lifecycle, ordered request admission, and wake arbitration, see [SDK Coordination](coordination-sdk.md).
+
 ## Prompting
 
 `prompt()` handles extension commands and expands file-based prompt templates before ordinary user messages enter the agent. For an accepted agent run, it resolves after the run finishes, including automatic retries.
