@@ -13,6 +13,7 @@ import {
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
+import { readExternalEntry } from "../../../core/external-event-records.ts";
 import type { SessionTreeNode } from "../../../core/session-manager.ts";
 import { formatReadLineRange } from "../../../core/tools/render-utils.ts";
 import { shortenHomePath } from "../../../utils/paths.ts";
@@ -569,6 +570,9 @@ class TreeList implements Component {
 		if (node.label) {
 			parts.push(node.label);
 		}
+		const external = readExternalEntry(entry);
+		if (external)
+			return [...parts, `[external ${external.kind}: ${external.eventId}] ${external.envelope}`].join(" ");
 
 		switch (entry.type) {
 			case "message": {
@@ -778,6 +782,13 @@ class TreeList implements Component {
 		let result: string;
 
 		const normalize = (s: string) => s.replace(/[\n\t]/g, " ").trim();
+		const external = readExternalEntry(entry);
+		if (external) {
+			const text =
+				theme.fg("customMessageLabel", `[external ${external.kind}: ${external.eventId}] `) +
+				normalize(external.envelope);
+			return isSelected ? theme.bold(text) : text;
+		}
 
 		switch (entry.type) {
 			case "message": {
@@ -906,6 +917,8 @@ class TreeList implements Component {
 
 	private getEntryCopyText(node: SessionTreeNode): string | undefined {
 		const entry = node.entry;
+		const external = readExternalEntry(entry);
+		if (external) return `[external ${external.kind}: ${external.eventId}] ${external.envelope}`;
 		let text: string | undefined;
 
 		switch (entry.type) {
