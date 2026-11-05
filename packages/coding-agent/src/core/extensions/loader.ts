@@ -13,11 +13,15 @@ import type { KeyId } from "@earendil-works/pi-tui";
 import type { createJiti } from "jiti";
 import { CONFIG_DIR_NAME, getAgentDir, isBunBinary, isBundledNode } from "../../config.ts";
 import { canonicalizePath, pathsEqual, resolvePath } from "../../utils/paths.ts";
+import { COORDINATION_SCHEDULER_CAPABILITIES } from "../coordination-scheduler-capabilities.ts";
 import { createEventBus, type EventBus } from "../event-bus.ts";
 import type { ExecOptions } from "../exec.ts";
 import { execCommand } from "../exec.ts";
+import { EXTERNAL_EVENT_CAPABILITIES } from "../external-event-capabilities.ts";
 import { type McpServerConfig, McpServerRegistry, validateMcpServerConfig } from "../mcp-servers.ts";
 import { readPiManifest } from "../pi-manifest.ts";
+import { REQUEST_ADMISSION_CAPABILITIES } from "../request-admission-capabilities.ts";
+import { RUNTIME_LIFECYCLE_CAPABILITIES } from "../runtime-lifecycle-capabilities.ts";
 import { createSyntheticSourceInfo, getSyntheticPathSource, isSyntheticPath } from "../source-info.ts";
 import { time } from "../timings.ts";
 import type { ModelRouteRequest, VirtualModelDefinition } from "../virtual-models.ts";
@@ -177,6 +181,10 @@ export function createExtensionRuntime(): ExtensionRuntime {
 		sendMessage: notInitialized,
 		sendUserMessage: notInitialized,
 		appendEntry: notInitialized,
+		refreshExternalEvents: notInitialized,
+		getRuntimeLifecycle: notInitialized,
+		getRequestAdmission: notInitialized,
+		getCoordinationScheduler: notInitialized,
 		setSessionName: notInitialized,
 		getSessionName: notInitialized,
 		setLabel: notInitialized,
@@ -277,6 +285,18 @@ function createExtensionAPI(
 	};
 
 	const api = {
+		get requestAdmission() {
+			assertActive();
+			return runtime.getRequestAdmission();
+		},
+		get coordinationScheduler() {
+			assertActive();
+			return runtime.getCoordinationScheduler();
+		},
+		externalEventCapabilities: EXTERNAL_EVENT_CAPABILITIES,
+		runtimeLifecycleCapabilities: RUNTIME_LIFECYCLE_CAPABILITIES,
+		requestAdmissionCapabilities: REQUEST_ADMISSION_CAPABILITIES,
+		coordinationSchedulerCapabilities: COORDINATION_SCHEDULER_CAPABILITIES,
 		// Registration methods - write to extension
 		on(event: string, handler: HandlerFn): () => void {
 			assertActive();
@@ -403,6 +423,16 @@ function createExtensionAPI(
 		appendEntry(customType: string, data?: unknown): void {
 			assertActive();
 			runtime.appendEntry(customType, data);
+		},
+
+		refreshExternalEvents(update): boolean {
+			assertActive();
+			return runtime.refreshExternalEvents(update);
+		},
+
+		getRuntimeLifecycle() {
+			assertActive();
+			return runtime.getRuntimeLifecycle();
 		},
 
 		setSessionName(name: string): void {

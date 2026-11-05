@@ -13,6 +13,8 @@ import {
 import type { KeyId } from "@earendil-works/pi-tui";
 import { type Theme, theme } from "../../modes/interactive/theme/theme.ts";
 import type { CacheWarmingAction } from "../cache-warmer.ts";
+import type { HoldMode } from "../coordination-scheduler.ts";
+import type { CoordinationGate } from "../coordination-scheduler-types.ts";
 import type { ResourceDiagnostic } from "../diagnostics.ts";
 import type { KeybindingsConfig } from "../keybindings.ts";
 import type { ModelRegistry } from "../model-registry.ts";
@@ -256,6 +258,144 @@ export type SwitchSessionHandler = (
 
 export type ReloadHandler = () => Promise<void>;
 
+type ContextOwner = { kind: "user" } | { kind: "model"; runId: string };
+
+/** Session coordination facades an AgentSession binds into its runner, next to bindCore(). */
+export interface ExtensionCoordinationActions
+	extends Pick<
+		ExtensionRuntime,
+		"refreshExternalEvents" | "getRuntimeLifecycle" | "getRequestAdmission" | "getCoordinationScheduler"
+	> {
+	/** Acquires an internal coordination hold token for gate arbitration. */
+	holdCoordination?: (gate: CoordinationGate, mode: HoldMode) => () => void;
+	/** Returns the currently active run ID for model-owned gate scoping. */
+	getCoordinationRunId?: () => string | undefined;
+}
+
+function wrapOwnershipUI(
+	getUI: () => ExtensionUIContext,
+	assertActive: () => void,
+	getOwner: () => ContextOwner,
+	holdCoordination?: (gate: CoordinationGate, mode: HoldMode) => () => void,
+	currentRunId?: () => string | undefined,
+): ExtensionUIContext {
+	const runWithHold = <T>(gate: CoordinationGate, mode: HoldMode, run: () => Promise<T>): Promise<T> => {
+		const release = holdCoordination?.(gate, mode);
+		try {
+			return run().finally(() => {
+				release?.();
+			});
+		} catch (error) {
+			release?.();
+			throw error;
+		}
+	};
+
+	const base = getUI();
+	return {
+		...base,
+		get theme() {
+			assertActive();
+			return getUI().theme;
+		},
+		select: (title, options, opts) => {
+			assertActive();
+			const owner = getOwner();
+			if (owner.kind === "model") {
+				if (currentRunId && currentRunId() !== owner.runId) {
+					return Promise.reject(new Error("Stale model interaction: run ID mismatch"));
+				}
+				return runWithHold({ kind: "input", owner: "model" }, { affect: "dispatch", runId: owner.runId }, () =>
+					getUI().select(title, options, opts),
+				);
+			}
+			return runWithHold({ kind: "utility", owner: "user" }, { affect: "new-starts" }, () =>
+				getUI().select(title, options, opts),
+			);
+		},
+		input: (title, placeholder, opts) => {
+			assertActive();
+			const owner = getOwner();
+			if (owner.kind === "model") {
+				if (currentRunId && currentRunId() !== owner.runId) {
+					return Promise.reject(new Error("Stale model interaction: run ID mismatch"));
+				}
+				return runWithHold({ kind: "input", owner: "model" }, { affect: "dispatch", runId: owner.runId }, () =>
+					getUI().input(title, placeholder, opts),
+				);
+			}
+			return runWithHold({ kind: "utility", owner: "user" }, { affect: "new-starts" }, () =>
+				getUI().input(title, placeholder, opts),
+			);
+		},
+		editor: (title, prefill) => {
+			assertActive();
+			const owner = getOwner();
+			if (owner.kind === "model") {
+				if (currentRunId && currentRunId() !== owner.runId) {
+					return Promise.reject(new Error("Stale model interaction: run ID mismatch"));
+				}
+				return runWithHold({ kind: "input", owner: "model" }, { affect: "dispatch", runId: owner.runId }, () =>
+					getUI().editor(title, prefill),
+				);
+			}
+			return runWithHold({ kind: "utility", owner: "user" }, { affect: "new-starts" }, () =>
+				getUI().editor(title, prefill),
+			);
+		},
+		confirm: (title, message, opts) => {
+			assertActive();
+			const owner = getOwner();
+			if (owner.kind === "model") {
+				if (currentRunId && currentRunId() !== owner.runId) {
+					return Promise.reject(new Error("Stale model interaction: run ID mismatch"));
+				}
+				return runWithHold({ kind: "permission", owner: "model" }, { affect: "dispatch", runId: owner.runId }, () =>
+					getUI().confirm(title, message, opts),
+				);
+			}
+			return runWithHold({ kind: "utility", owner: "user" }, { affect: "new-starts" }, () =>
+				getUI().confirm(title, message, opts),
+			);
+		},
+		custom: (factory, options) => {
+			assertActive();
+			const owner = getOwner();
+			if (owner.kind === "model" && currentRunId && currentRunId() !== owner.runId) {
+				return Promise.reject(new Error("Stale model interaction: run ID mismatch"));
+			}
+			const blocked = options?.blocked;
+			if (blocked?.kind === "question") {
+				const activeRunId = owner.kind === "model" ? owner.runId : currentRunId?.();
+				if (activeRunId) {
+					return runWithHold({ kind: "input", owner: "model" }, { affect: "dispatch", runId: activeRunId }, () =>
+						getUI().custom(factory, options),
+					);
+				}
+				return runWithHold({ kind: "input", owner: "model" }, { affect: "new-starts" }, () =>
+					getUI().custom(factory, options),
+				);
+			}
+			if (blocked?.kind === "permission" || blocked?.kind === "auth") {
+				const activeRunId = owner.kind === "model" ? owner.runId : currentRunId?.();
+				if (activeRunId) {
+					return runWithHold(
+						{ kind: blocked.kind, owner: "model" },
+						{ affect: "dispatch", runId: activeRunId },
+						() => getUI().custom(factory, options),
+					);
+				}
+				return runWithHold({ kind: blocked.kind, owner: "model" }, { affect: "new-starts" }, () =>
+					getUI().custom(factory, options),
+				);
+			}
+			return runWithHold({ kind: "utility", owner: "user" }, { affect: "new-starts" }, () =>
+				getUI().custom(factory, options),
+			);
+		},
+	};
+}
+
 export type ShutdownHandler = () => void;
 
 /**
@@ -263,6 +403,18 @@ export type ShutdownHandler = () => void;
  * Returns true if the event was emitted, false if there were no handlers.
  */
 export async function emitSessionShutdownEvent(
+	extensionRunner: ExtensionRunner,
+	event: SessionShutdownEvent,
+): Promise<boolean> {
+	// Teardown, reload and disposal can race on one runner; it sees one session_shutdown.
+	const shutdown = sessionShutdowns.get(extensionRunner) ?? emitSessionShutdownOnce(extensionRunner, event);
+	sessionShutdowns.set(extensionRunner, shutdown);
+	return shutdown;
+}
+
+const sessionShutdowns = new WeakMap<ExtensionRunner, Promise<boolean>>();
+
+async function emitSessionShutdownOnce(
 	extensionRunner: ExtensionRunner,
 	event: SessionShutdownEvent,
 ): Promise<boolean> {
@@ -398,6 +550,27 @@ export class ExtensionRunner {
 	private staleMessage: string | undefined;
 	private uiPromptDepth = 0;
 	private activeUIPrompt: { kind: UIPromptKind; title?: string } | undefined;
+
+	private holdCoordinationFn?: (gate: CoordinationGate, mode: HoldMode) => () => void;
+	private getCoordinationRunIdFn?: () => string | undefined;
+
+	bindCoordination(actions: ExtensionCoordinationActions): void {
+		this.runtime.refreshExternalEvents = actions.refreshExternalEvents;
+		this.runtime.getRuntimeLifecycle = () => {
+			this.assertActive();
+			return actions.getRuntimeLifecycle();
+		};
+		this.runtime.getRequestAdmission = () => {
+			this.assertActive();
+			return actions.getRequestAdmission();
+		};
+		this.runtime.getCoordinationScheduler = () => {
+			this.assertActive();
+			return actions.getCoordinationScheduler();
+		};
+		this.holdCoordinationFn = actions.holdCoordination;
+		this.getCoordinationRunIdFn = actions.getCoordinationRunId;
+	}
 
 	constructor(
 		extensions: Extension[],
@@ -892,10 +1065,30 @@ export class ExtensionRunner {
 		const runner = this;
 		const getModel = this.getModel;
 		const getScopedModels = this.getScopedModels;
+		const capturedRunId = this.getCoordinationRunIdFn?.();
+		const capturedOwner: ContextOwner | undefined = capturedRunId
+			? { kind: "model", runId: capturedRunId }
+			: undefined;
 		return {
+			get requestAdmission() {
+				runner.assertActive();
+				return runner.runtime.getRequestAdmission();
+			},
+			get coordinationScheduler() {
+				runner.assertActive();
+				return runner.runtime.getCoordinationScheduler();
+			},
 			get ui() {
 				runner.assertActive();
-				return runner.uiContext;
+				const runId = capturedOwner ? capturedOwner.runId : runner.getCoordinationRunIdFn?.();
+				const owner: ContextOwner = runId ? { kind: "model", runId } : { kind: "user" };
+				return wrapOwnershipUI(
+					() => runner.uiContext,
+					() => runner.assertActive(),
+					() => owner,
+					runner.holdCoordinationFn,
+					runner.getCoordinationRunIdFn,
+				);
 			},
 			get mode() {
 				runner.assertActive();
@@ -974,8 +1167,21 @@ export class ExtensionRunner {
 	 */
 	createToolContext(toolCallId: string, signal: AbortSignal | undefined): ExtensionToolContext {
 		const runner = this;
+		const capturedRunId = this.getCoordinationRunIdFn?.() ?? "";
 		// createContext() returns a fresh object, so adding properties does not affect other contexts.
 		return Object.defineProperties(this.createContext() as ExtensionToolContext, {
+			ui: {
+				get() {
+					runner.assertActive();
+					return wrapOwnershipUI(
+						() => runner.uiContext,
+						() => runner.assertActive(),
+						() => ({ kind: "model", runId: capturedRunId }),
+						runner.holdCoordinationFn,
+						runner.getCoordinationRunIdFn,
+					);
+				},
+			},
 			tools: {
 				get() {
 					runner.assertActive();
@@ -1002,6 +1208,7 @@ export class ExtensionRunner {
 	}
 
 	createCommandContext(): ExtensionCommandContext {
+		const runner = this;
 		// Use property descriptors instead of object spread so the guarded getters from
 		// createContext() stay lazy. A spread would eagerly read them once and freeze the
 		// old values into the returned object, bypassing stale-instance checks.
@@ -1009,6 +1216,18 @@ export class ExtensionRunner {
 			{},
 			Object.getOwnPropertyDescriptors(this.createContext()),
 		) as ExtensionCommandContext;
+		Object.defineProperty(context, "ui", {
+			get() {
+				runner.assertActive();
+				return wrapOwnershipUI(
+					() => runner.uiContext,
+					() => runner.assertActive(),
+					() => ({ kind: "user" }),
+					runner.holdCoordinationFn,
+					runner.getCoordinationRunIdFn,
+				);
+			},
+		});
 		context.getSystemPromptOptions = () => {
 			this.assertActive();
 			return this.getSystemPromptOptionsFn();
