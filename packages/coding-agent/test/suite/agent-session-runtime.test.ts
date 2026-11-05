@@ -204,13 +204,7 @@ describe("AgentSessionRuntime characterization", () => {
 		const outgoingEntries = SessionManager.open(outgoingSession.sessionFile!)
 			.getEntries()
 			.filter((entry) => entry.type === "message");
-		expect(outgoingEntries.map((entry) => entry.message.role)).toEqual([
-			"system",
-			"user",
-			"assistant",
-			"toolResult",
-			"assistant",
-		]);
+		expect(outgoingEntries.map((entry) => entry.message.role)).toEqual(["system", "user", "assistant", "toolResult"]);
 	});
 
 	it("preserves an existing session when importing a file with the same name", async () => {

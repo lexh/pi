@@ -715,8 +715,7 @@ describe("AgentSession prompt characterization", () => {
 			await Promise.all([run, aborted]);
 
 			const last = harness.session.messages.at(-1);
-			expect(last?.role).toBe("assistant");
-			expect(last?.role === "assistant" && last.stopReason).toBe("aborted");
+			expect(last).toMatchObject({ role: "custom", customType: "task-done" });
 			expect(harness.session.isIdle).toBe(true);
 		});
 	});

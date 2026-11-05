@@ -285,6 +285,10 @@ describe("AgentSession concurrent prompt guard", () => {
 		await session.abort();
 		await firstPrompt.catch(() => {});
 
+		expect(sawSteeringMessage).toBe(false);
+		expect(session.getSteeringMessages()).toContain("Steer from extension");
+
+		await session.prompt("Next message");
 		expect(sawSteeringMessage).toBe(true);
 	});
 
