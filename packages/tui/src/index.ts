@@ -174,6 +174,7 @@ export {
 	type TUI,
 	type TuiInputListener,
 	type TuiInputListenerResult,
+	type TuiInputObserver,
 	type TuiMode,
 	type TuiMouseButton,
 	type TuiMouseEvent,
