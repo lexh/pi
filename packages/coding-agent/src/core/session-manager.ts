@@ -32,6 +32,26 @@ import { StringDecoder } from "string_decoder";
 import { APP_NAME, getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.ts";
 import { normalizePath, pathsEqual, resolvePath } from "../utils/paths.ts";
 import {
+	ACTIVE_SELECTION,
+	assertOrdinaryEntry,
+	canonicalJson,
+	decodeExternal,
+	decodeExternalHistory,
+	decodeSelection,
+	type EntryReceipt,
+	EXTERNAL_HISTORY,
+	EXTERNAL_RECORD,
+	type ExternalRecord,
+	isReservedEntryId,
+	RECORD_CAPABILITIES,
+	recordKey,
+	reserveEntryId,
+	type SelectionData,
+} from "./durable-records.ts";
+import { appendDurable, installSnapshot, readStrictSession } from "./durable-session-io.ts";
+import { copyExternalHistory } from "./external-event-inheritance.ts";
+import { type AdmissionEntry, externalEntryToMessage } from "./external-event-records.ts";
+import {
 	type BashExecutionMessage,
 	type CustomMessage,
 	createBranchSummaryMessage,
@@ -47,6 +67,7 @@ export interface SessionHeader {
 	timestamp: string;
 	cwd: string;
 	parentSession?: string;
+	durableRecords?: 1;
 }
 
 export interface NewSessionOptions {
@@ -259,6 +280,9 @@ export type ReadonlySessionManager = Pick<
 	| "getEntries"
 	| "getTree"
 	| "getSessionName"
+	| "getEntryOnce"
+	| "recordCapabilities"
+	| "isPersisted"
 >;
 
 function createSessionId(): string {
@@ -277,7 +301,7 @@ export function assertValidSessionId(id: string): void {
 function generateId(byId: { has(id: string): boolean }): string {
 	for (let i = 0; i < 100; i++) {
 		const id = randomUUID().slice(0, 8);
-		if (!byId.has(id)) return id;
+		if (!byId.has(id) && !isReservedEntryId(byId, id)) return id;
 	}
 	// Fallback to full UUID if somehow we have collisions
 	return randomUUID();
@@ -437,6 +461,8 @@ function getSessionContextSettings(path: SessionEntry[]): Pick<SessionContext, "
  * Plain custom entries are display/state entries and do not participate in context.
  */
 export function sessionEntryToContextMessages(entry: SessionEntry): AgentMessage[] {
+	const external = externalEntryToMessage(entry);
+	if (external) return [external];
 	if (entry.type === "message") {
 		const message = entry.message;
 		// Session files are parsed without validation; old versions, forks, or
@@ -625,9 +651,16 @@ function parseSessionEntryLine(line: string): FileEntry | null {
 }
 
 /** Exported for testing */
-export function loadEntriesFromFile(filePath: string): FileEntry[] {
+export function loadEntriesFromFile(filePath: string, repair = true): FileEntry[] {
 	const resolvedFilePath = normalizePath(filePath);
 	if (!existsSync(resolvedFilePath)) return [];
+
+	const discoveryHeader = readSessionHeaderForDiscovery(resolvedFilePath);
+	const marker = (discoveryHeader as { durableRecords?: unknown } | null)?.durableRecords;
+	if (marker !== undefined) {
+		if (marker !== 1) throw new Error(`Unsupported durable record version: ${String(marker)}`);
+		return readStrictSession(resolvedFilePath, repair ? "repair" : "readonly") as FileEntry[];
+	}
 
 	const entries: FileEntry[] = [];
 	let pending = "";
@@ -666,7 +699,7 @@ export function loadEntriesFromFile(filePath: string): FileEntry[] {
 		return [];
 	}
 
-	if (pending) appendFileSync(resolvedFilePath, "\n");
+	if (pending && repair) appendFileSync(resolvedFilePath, "\n");
 	return entries;
 }
 
@@ -757,11 +790,31 @@ export function findMostRecentSession(sessionDir: string, cwd?: string): string 
 			.map((path) => ({ path, mtime: statSync(path).mtimeMs }))
 			.sort((a, b) => b.mtime - a.mtime);
 
+		let emptyFallback: string | null = null;
 		for (const { path } of files) {
 			const header = readSessionHeaderForDiscovery(path);
-			if (header && (!resolvedCwd || sessionCwdMatches(getSessionHeaderCwd(header), resolvedCwd))) return path;
+			if (!header || (resolvedCwd && !sessionCwdMatches(getSessionHeaderCwd(header), resolvedCwd))) continue;
+			try {
+				if ((header.version ?? 1) > CURRENT_SESSION_VERSION) continue;
+				const entries =
+					header.durableRecords === 1
+						? (readStrictSession(path, "readonly") as FileEntry[])
+						: loadEntriesFromFile(path, false);
+				const meaningful = entries.some(
+					(entry) =>
+						(entry.type === "message" && (entry.message.role === "user" || entry.message.role === "assistant")) ||
+						(entry.type === "custom" && entry.customType === EXTERNAL_RECORD && !!decodeExternal(entry.data)) ||
+						(entry.type === "custom" &&
+							entry.customType === EXTERNAL_HISTORY &&
+							!!decodeExternalHistory(entry.data)),
+				);
+				if (meaningful) return path;
+				emptyFallback ??= path;
+			} catch {
+				// Explicit open supplies actionable errors for corrupt candidates.
+			}
 		}
-		return null;
+		return emptyFallback;
 	} catch {
 		// Directory access and stat races make recent-session discovery unavailable.
 		return null;
@@ -1004,6 +1057,14 @@ export class SessionManager {
 	private labelsById: Map<string, string> = new Map();
 	private labelTimestampsById: Map<string, string> = new Map();
 	private leafId: string | null = null;
+	readonly recordCapabilities = RECORD_CAPABILITIES;
+	private durableFailure: unknown;
+	private legacyAdoptionError: unknown;
+
+	private _assertWritable(): void {
+		if (this.durableFailure !== undefined)
+			throw new Error("Durable write uncertain; reopen this session before retrying");
+	}
 
 	private constructor(
 		cwd: string,
@@ -1037,6 +1098,14 @@ export class SessionManager {
 	private _setSessionFile(sessionFile: string, preloadedFileEntries?: FileEntry[]): void {
 		this.sessionFile = resolvePath(sessionFile);
 		if (existsSync(this.sessionFile)) {
+			let sourceError: unknown;
+			if (statSync(this.sessionFile).size > 0) {
+				try {
+					readStrictSession(this.sessionFile, "strict");
+				} catch (error) {
+					sourceError = error;
+				}
+			}
 			const entries = preloadedFileEntries ?? loadEntriesFromFile(this.sessionFile);
 
 			// If file was empty, initialize it with a valid session header. If it was
@@ -1054,6 +1123,7 @@ export class SessionManager {
 			}
 
 			this._loadEntries(entries);
+			this.legacyAdoptionError = sourceError;
 			this.flushed = true;
 		} else {
 			const explicitPath = this.sessionFile;
@@ -1063,6 +1133,8 @@ export class SessionManager {
 	}
 
 	newSession(options?: NewSessionOptions): string | undefined {
+		this.durableFailure = undefined;
+		this.legacyAdoptionError = undefined;
 		if (options?.id !== undefined) {
 			assertValidSessionId(options.id);
 		}
@@ -1091,7 +1163,11 @@ export class SessionManager {
 	}
 
 	private _loadEntries(entries: FileEntry[], options?: NewSessionOptions): void {
+		this.durableFailure = undefined;
 		const header = entries.find((e) => e.type === "session") as SessionHeader | undefined;
+		if (header && (header.version ?? 1) > CURRENT_SESSION_VERSION) {
+			throw new Error(`Unsupported session version: ${header.version}`);
+		}
 
 		if (header) {
 			this.fileEntries = entries;
@@ -1115,8 +1191,26 @@ export class SessionManager {
 		this.leafId = null;
 		for (const entry of this.fileEntries) {
 			if (entry.type === "session") continue;
+			if (entry.type === "custom" && entry.customType === ACTIVE_SELECTION) {
+				reserveEntryId(this.byId, entry.id);
+				const selection = decodeSelection(entry.data);
+				if (selection.leafId !== null && !this.byId.has(selection.leafId)) {
+					throw new Error(`Selection target not found: ${selection.leafId}`);
+				}
+				this.leafId = selection.leafId;
+				continue;
+			}
 			this.byId.set(entry.id, entry);
-			this.leafId = entry.id;
+			if (entry.type === "custom" && entry.customType === EXTERNAL_RECORD) {
+				entry.data = decodeExternal(entry.data);
+				Object.freeze(entry);
+			} else {
+				if (entry.type === "custom" && entry.customType === EXTERNAL_HISTORY) {
+					entry.data = decodeExternalHistory(entry.data);
+					Object.freeze(entry);
+				}
+				this.leafId = entry.id;
+			}
 			if (entry.type === "label") {
 				if (entry.label) {
 					this.labelsById.set(entry.targetId, entry.label);
@@ -1127,10 +1221,206 @@ export class SessionManager {
 				}
 			}
 		}
+		this._externalEntries();
+	}
+
+	private _externalEntries(): Array<{ entry: CustomEntry; record: ExternalRecord }> {
+		const result: Array<{ entry: CustomEntry; record: ExternalRecord }> = [];
+		const keys = new Set<string>();
+		for (const entry of this.getEntries()) {
+			if (entry.type !== "custom" || entry.customType !== EXTERNAL_RECORD) continue;
+			const record = decodeExternal(entry.data);
+			const key = recordKey(record);
+			if (keys.has(key)) throw new Error(`Duplicate physical record key: ${key}`);
+			keys.add(key);
+			result.push({ entry, record });
+		}
+		return result;
+	}
+
+	private _receipt(entry: CustomEntry, record: ExternalRecord): EntryReceipt {
+		if (!this.sessionFile) throw new Error("No saved session file");
+		return { sessionId: this.sessionId, sessionFile: this.sessionFile, entryId: entry.id, key: recordKey(record) };
+	}
+
+	getEntryOnce(key: string): EntryReceipt | undefined {
+		this._assertWritable();
+		if (this.getHeader()?.durableRecords !== 1 || !this.flushed)
+			throw new Error("Call persistNow before requesting durable receipts");
+		const found = this._externalEntries().find((candidate) => recordKey(candidate.record) === key);
+		return found ? this._receipt(found.entry, found.record) : undefined;
+	}
+
+	appendEntryOnce(input: ExternalRecord, parentId: string | null): EntryReceipt {
+		this._assertWritable();
+		if (!this.persist || !this.sessionFile || this.getHeader()?.durableRecords !== 1 || !this.flushed) {
+			throw new Error("Call persistNow on a saved session before appendEntryOnce");
+		}
+		const record = decodeExternal(input);
+		const key = recordKey(record);
+		const found = this._externalEntries().find((candidate) => recordKey(candidate.record) === key);
+		if (found) {
+			if (found.entry.parentId !== parentId || canonicalJson(found.record) !== canonicalJson(record)) {
+				throw new Error(`Record key conflict: ${key}`);
+			}
+			return this._receipt(found.entry, found.record);
+		}
+		if (parentId !== null && !this.byId.has(parentId)) throw new Error(`Entry ${parentId} not found`);
+		if (record.kind === "admission" && record.branchAnchor !== parentId) throw new Error("Admission anchor mismatch");
+		const entry: CustomEntry<ExternalRecord> = Object.freeze({
+			type: "custom",
+			customType: EXTERNAL_RECORD,
+			id: generateId(this.byId),
+			parentId,
+			timestamp: new Date().toISOString(),
+			data: record,
+		});
+		try {
+			appendDurable(this.sessionFile, [entry]);
+		} catch (error) {
+			this.durableFailure = error;
+			throw error;
+		}
+		this.fileEntries.push(entry);
+		this.byId.set(entry.id, entry);
+		return this._receipt(entry, record);
+	}
+
+	/** Materialize an immutable admission chain without changing the selected leaf. */
+	appendAdmissionBatchOnce(descriptors: readonly AdmissionEntry[]): EntryReceipt[] {
+		this._assertWritable();
+		if (!this.persist || !this.sessionFile || this.getHeader()?.durableRecords !== 1 || !this.flushed) {
+			throw new Error("Call persistNow on a saved session before appending admissions");
+		}
+		const physical = new Map(
+			this.fileEntries.flatMap((entry) => (entry.type === "session" ? [] : [[entry.id, entry] as const])),
+		);
+		const existingKeys = new Map(this._externalEntries().map(({ entry, record }) => [recordKey(record), entry]));
+		const ids = new Set<string>();
+		const keys = new Set<string>();
+		const events = new Set<string>();
+		const planned: CustomEntry<ExternalRecord>[] = [];
+		let prefix = 0;
+		let missing = false;
+		for (const descriptor of descriptors) {
+			const record = decodeExternal(descriptor.record);
+			if (record.kind !== "admission") throw new Error("Expected admission record");
+			if (typeof descriptor.entryId !== "string" || !descriptor.entryId || ids.has(descriptor.entryId))
+				throw new Error("Invalid or duplicate entry id");
+			if (
+				typeof descriptor.timestamp !== "string" ||
+				!Number.isFinite(Date.parse(descriptor.timestamp)) ||
+				new Date(descriptor.timestamp).toISOString() !== descriptor.timestamp
+			)
+				throw new Error("Invalid admission timestamp");
+			const key = recordKey(record);
+			if (keys.has(key) || events.has(record.eventId)) throw new Error("Duplicate admission key or event");
+			const first = planned[0]?.data;
+			if (
+				first &&
+				(first.kind !== "admission" ||
+					first.requestId !== record.requestId ||
+					first.recipientIdentity !== record.recipientIdentity ||
+					first.instanceId !== record.instanceId ||
+					first.epoch !== record.epoch)
+			)
+				throw new Error("Mixed admission chain identity");
+			if (
+				planned.length
+					? record.branchAnchor !== planned[planned.length - 1]!.id
+					: record.branchAnchor !== null && !this.byId.has(record.branchAnchor)
+			)
+				throw new Error("Invalid admission chain anchor");
+			const entry: CustomEntry<ExternalRecord> = Object.freeze({
+				type: "custom",
+				customType: EXTERNAL_RECORD,
+				id: descriptor.entryId,
+				parentId: record.branchAnchor,
+				timestamp: descriptor.timestamp,
+				data: record,
+			});
+			const physicalMatch = physical.get(entry.id);
+			const keyMatch = existingKeys.get(key);
+			if (physicalMatch) {
+				if (missing || canonicalJson(physicalMatch) !== canonicalJson(entry) || keyMatch?.id !== entry.id)
+					throw new Error("Conflicting or non-prefix admission entry");
+				prefix++;
+			} else {
+				if (keyMatch) throw new Error("Conflicting admission record key");
+				missing = true;
+			}
+			ids.add(entry.id);
+			keys.add(key);
+			events.add(record.eventId);
+			planned.push(entry);
+		}
+		const suffix = planned.slice(prefix);
+		if (suffix.length) {
+			try {
+				appendDurable(this.sessionFile, suffix);
+			} catch (error) {
+				this.durableFailure = error;
+				throw error;
+			}
+			for (const entry of suffix) {
+				this.fileEntries.push(entry);
+				this.byId.set(entry.id, entry);
+			}
+		}
+		return planned.map((entry) => this._receipt(entry, entry.data!));
+	}
+
+	private _selectionEntry(leafId: string | null): CustomEntry<SelectionData> {
+		const id = generateId(this.byId);
+		reserveEntryId(this.byId, id);
+		return {
+			type: "custom",
+			customType: ACTIVE_SELECTION,
+			id,
+			parentId: null,
+			timestamp: new Date().toISOString(),
+			data: { version: 1, leafId },
+		};
+	}
+
+	persistNow(): string {
+		this._assertWritable();
+		if (!this.persist || !this.sessionFile)
+			throw new Error("--no-session cannot own a recoverable mailbox; start a saved session");
+		if (this.getHeader()?.durableRecords === 1 && this.flushed) return this.sessionFile;
+		if (this.legacyAdoptionError !== undefined)
+			throw new Error(`Unsafe legacy adoption: ${String(this.legacyAdoptionError)}`);
+		if (this.flushed) readStrictSession(this.sessionFile, "strict");
+		const header = this.getHeader();
+		if (!header) throw new Error("Cannot persist a session without a header");
+		const snapshot: FileEntry[] = [
+			{ ...header, durableRecords: 1 },
+			...this.fileEntries.filter((entry) => entry.type !== "session"),
+			this._selectionEntry(this.leafId),
+		];
+		try {
+			installSnapshot(this.sessionFile, snapshot, !this.flushed);
+		} catch (error) {
+			this.durableFailure = error;
+			throw error;
+		}
+		this.fileEntries = snapshot;
+		this.flushed = true;
+		return this.sessionFile;
 	}
 
 	private _rewriteFile(): void {
 		if (!this.persist || !this.sessionFile) return;
+		if (this.getHeader()?.durableRecords === 1) {
+			this._assertWritable();
+			try {
+				installSnapshot(this.sessionFile, this.fileEntries, false);
+			} catch (error) {
+				this.durableFailure = error;
+				throw error;
+			}
+			return;
+		}
 		const fd = openSync(this.sessionFile, "w");
 		try {
 			for (const entry of this.fileEntries) {
@@ -1178,7 +1468,17 @@ export class SessionManager {
 	}
 
 	_persist(entry: SessionEntry): void {
+		this._assertWritable();
 		if (!this.persist || !this.sessionFile) return;
+		if (this.getHeader()?.durableRecords === 1) {
+			try {
+				appendDurable(this.sessionFile, [entry]);
+			} catch (error) {
+				this.durableFailure = error;
+				throw error;
+			}
+			return;
+		}
 
 		if (!this.flushed) {
 			if (!this._hasConversation()) return;
@@ -1197,10 +1497,16 @@ export class SessionManager {
 	}
 
 	private _appendEntry(entry: SessionEntry): void {
+		this._assertWritable();
+		assertOrdinaryEntry(entry);
+		// A durable entry is written before it is added, so a failed write leaves memory as it was.
+		const durable = this.getHeader()?.durableRecords === 1;
+		if (durable) this._persist(entry);
 		const previousLeafId = this.leafId;
 		this.fileEntries.push(entry);
 		this.byId.set(entry.id, entry);
 		this.leafId = entry.id;
+		if (durable) return;
 		try {
 			this._persist(entry);
 		} catch (error) {
@@ -1536,7 +1842,9 @@ export class SessionManager {
 	 * change the leaf pointer. Entries cannot be modified or deleted.
 	 */
 	getEntries(): SessionEntry[] {
-		return this.fileEntries.filter((e): e is SessionEntry => e.type !== "session");
+		return this.fileEntries.filter(
+			(e): e is SessionEntry => e.type !== "session" && !(e.type === "custom" && e.customType === ACTIVE_SELECTION),
+		);
 	}
 
 	/**
@@ -1594,11 +1902,24 @@ export class SessionManager {
 	 * will create a child of that entry, forming a new branch. Existing entries
 	 * are not modified or deleted.
 	 */
-	branch(branchFromId: string): void {
-		if (!this.byId.has(branchFromId)) {
-			throw new Error(`Entry ${branchFromId} not found`);
+	private _selectLeaf(leafId: string | null): void {
+		this._assertWritable();
+		if (leafId !== null && !this.byId.has(leafId)) throw new Error(`Entry ${leafId} not found`);
+		if (this.getHeader()?.durableRecords === 1 && this.persist && this.sessionFile) {
+			const checkpoint = this._selectionEntry(leafId);
+			try {
+				appendDurable(this.sessionFile, [checkpoint]);
+			} catch (error) {
+				this.durableFailure = error;
+				throw error;
+			}
+			this.fileEntries.push(checkpoint);
 		}
-		this.leafId = branchFromId;
+		this.leafId = leafId;
+	}
+
+	branch(branchFromId: string): void {
+		this._selectLeaf(branchFromId);
 	}
 
 	/**
@@ -1607,7 +1928,7 @@ export class SessionManager {
 	 * Use this when navigating to re-edit the first user message.
 	 */
 	resetLeaf(): void {
-		this.leafId = null;
+		this._selectLeaf(null);
 	}
 
 	/**
@@ -1626,7 +1947,7 @@ export class SessionManager {
 			throw new Error(`Entry ${branchFromId} not found`);
 		}
 		const fromId = this.leafId ?? "root";
-		this.leafId = branchFromId;
+		this._selectLeaf(branchFromId);
 		const entry: BranchSummaryEntry = {
 			type: "branch_summary",
 			id: generateId(this.byId),
@@ -1649,20 +1970,24 @@ export class SessionManager {
 	 */
 	createBranchedSession(leafId: string): string | undefined {
 		const previousSessionFile = this.sessionFile;
-		const path = this.getBranch(leafId);
-		if (path.length === 0) {
+		const rawPath = this.getBranch(leafId);
+		if (rawPath.length === 0) {
 			throw new Error(`Entry ${leafId} not found`);
 		}
 
+		const path = copyExternalHistory(rawPath, this.sessionId);
+		const strict = this.getHeader()?.durableRecords === 1;
 		// Filter out LabelEntry from path - we'll recreate them from the resolved map.
 		// Because labels are real tree entries, later entries can be children of labels;
 		// removing labels requires re-chaining the retained path to avoid orphaned subtrees.
 		const pathWithoutLabels: SessionEntry[] = [];
 		const replacementByLabelId = new Map<string, string>();
+		const ancestorByLabelId = new Map<string, string | null>();
 		const pendingLabelIds: string[] = [];
 		let pathParentId: string | null = null;
 		for (const entry of path) {
 			if (entry.type === "label") {
+				ancestorByLabelId.set(entry.id, pathParentId);
 				pendingLabelIds.push(entry.id);
 				continue;
 			}
@@ -1680,7 +2005,9 @@ export class SessionManager {
 									? entry.id
 									: (replacementByLabelId.get(entry.firstKeptEntryId) ?? entry.firstKeptEntryId),
 						}
-					: { ...entry, parentId: pathParentId },
+					: entry.type === "branch_summary" && ancestorByLabelId.has(entry.fromId)
+						? { ...entry, parentId: pathParentId, fromId: ancestorByLabelId.get(entry.fromId) ?? "root" }
+						: { ...entry, parentId: pathParentId },
 			);
 			pathParentId = entry.id;
 		}
@@ -1697,6 +2024,7 @@ export class SessionManager {
 			timestamp,
 			cwd: this.cwd,
 			parentSession: this.persist ? previousSessionFile : undefined,
+			...(strict ? { durableRecords: 1 as const } : {}),
 		};
 
 		// Collect labels for entries in the path
@@ -1727,14 +2055,21 @@ export class SessionManager {
 				parentId = labelEntry.id;
 			}
 
-			this.fileEntries = [header, ...pathWithoutLabels, ...labelEntries];
+			const entries: FileEntry[] = [header, ...pathWithoutLabels, ...labelEntries];
+			if (strict) {
+				entries.push(this._selectionEntry(parentId));
+				installSnapshot(newSessionFile, entries, true);
+			}
+			this.fileEntries = entries;
 			this.sessionId = newSessionId;
 			this.sessionFile = newSessionFile;
 			this._buildIndex();
 
 			// Use the same rule as _persist(): write now if the branched path already
 			// has a conversation, otherwise let _persist() create the file later.
-			if (this._hasConversation()) {
+			if (strict) {
+				this.flushed = true;
+			} else if (this._hasConversation()) {
 				this._rewriteFile();
 				this.flushed = true;
 			} else {
@@ -1792,7 +2127,7 @@ export class SessionManager {
 				if (!(error instanceof SessionHeaderScanLimitError)) throw error;
 				// The bounded scan is only a discovery optimization. A full load remains
 				// authoritative for legacy files with very large headers or prefixes.
-				preloadedFileEntries = loadEntriesFromFile(resolvedPath);
+				preloadedFileEntries = loadEntriesFromFile(resolvedPath, false);
 				const firstEntry = preloadedFileEntries[0];
 				header = firstEntry?.type === "session" ? firstEntry : null;
 			}
@@ -1848,6 +2183,14 @@ export class SessionManager {
 			throw new Error(`Cannot fork: source session has no header: ${resolvedSourcePath}`);
 		}
 
+		const sourceManager = SessionManager.open(resolvedSourcePath);
+		const sourceTree = sourceManager.getEntries();
+		const copiedEntries = copyExternalHistory(sourceTree, sourceHeader.id);
+		const retained = new Set(copiedEntries.map((entry) => entry.id));
+		let selected = sourceManager.getLeafId();
+		while (selected !== null && !retained.has(selected))
+			selected = sourceManager.getEntry(selected)?.parentId ?? null;
+
 		const dir = sessionDir ? normalizePath(sessionDir) : getDefaultSessionDir(resolvedTargetCwd);
 		if (!existsSync(dir)) {
 			mkdirSync(dir, { recursive: true });
@@ -1870,16 +2213,28 @@ export class SessionManager {
 			timestamp,
 			cwd: resolvedTargetCwd,
 			parentSession: resolvedSourcePath,
+			...(sourceHeader.durableRecords === 1 ? { durableRecords: 1 as const } : {}),
 		};
+		if (sourceHeader.durableRecords === 1) {
+			const ids = new Set(copiedEntries.map((entry) => entry.id));
+			const selection: CustomEntry<SelectionData> = {
+				type: "custom",
+				customType: ACTIVE_SELECTION,
+				id: generateId(ids),
+				parentId: null,
+				timestamp,
+				data: { version: 1, leafId: selected },
+			};
+			installSnapshot(newSessionFile, [newHeader, ...copiedEntries, selection], true);
+			return new SessionManager(resolvedTargetCwd, dir, newSessionFile, true);
+		}
 		// Write the header and all non-header entries through one fd. Reopening the file per entry
 		// is slow where open/close is expensive (e.g. filesystem security monitors).
 		const fd = openSync(newSessionFile, "wx");
 		try {
 			writeFileSync(fd, `${JSON.stringify(newHeader)}\n`);
-			for (const entry of sourceEntries) {
-				if (entry.type !== "session") {
-					writeFileSync(fd, `${JSON.stringify(entry)}\n`);
-				}
+			for (const entry of copiedEntries) {
+				writeFileSync(fd, `${JSON.stringify(entry)}\n`);
 			}
 		} finally {
 			closeSync(fd);
