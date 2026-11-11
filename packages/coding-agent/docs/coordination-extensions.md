@@ -110,6 +110,12 @@ Extension UI calls (`ctx.ui.select`, `confirm`, `input`, `editor`, `custom`) acq
 
 See [SDK wake and continuation arbitration](coordination-sdk.md#wake-and-continuation-arbitration) for permission vs runtime epochs, reference-only waits, one-shot grants, blocked-target behavior, nonactivating recovery, and implementation boundaries. Real adapter/service authority and durable records are caller responsibilities; no helper launch, checkpoint batch finalization, process cleanup, global notification/results UI, live inference, or product/P0 readiness is provided.
 
+## Managed processes
+
+Check `assertExtensionManagedProcessSupport(pi)` during loading; it checks the descriptor and the own `managedProcesses` getter without invoking it, because the dynamic runtime getters are not usable while extensions load. Ordinary pi remains available when a guard fails, and nothing falls back to claiming process coverage. The extension API for spawning and declaring coverage is described in [Managed Local Processes](extensions.md#managed-local-processes); the adapter contract is in [SDK Coordination](coordination-sdk.md#managed-processes).
+
+Reconcile the lifecycle first, retained process evidence second, and scheduler permissions last. Treat service notifications as hints to poll, not as commands: a stop acknowledgement must not schedule a scheduler tick or a recursive lifecycle write. Answer `requestStop` with `requested` before waiting for actual tool or process settlement; a controller that waits for `settled` before the service may send TERM deadlocks a command whose output waiter correctly waits for the service-driven exit. Finalization and stop policy are additional service capabilities; descriptor support alone is not a claim that Stop is enabled.
+
 ## Pre-routing input observers and gate ownership
 
 `TUI.addInputObserver(observer)` (and `removeInputObserver(observer)`) registers a non-consuming `TuiInputObserver = (data: string) => void` on both `TuiMainScreen` and `TuiAltScreen`. Each terminal input packet is delivered to a snapshot of registered input observers after terminal color and color-scheme report responses are filtered, and before `addInputListener` handlers (which may consume or rewrite input), debug/viewport keys, key-release focus filtering, and overlay or focused-component routing. Observer return values are ignored and observer errors are not swallowed.

@@ -101,6 +101,7 @@ For isolation setup and limitations, see [Run Pi in an isolated environment](../
 | Extension | Description |
 |-----------|-------------|
 | `mac-system-theme.ts` | Syncs pi theme with macOS dark/light mode |
+| `managed-spawn.ts` | Starts a local process through the managed process API and declares its coverage |
 
 ### Resources
 

@@ -1,7 +1,7 @@
 /**
  * Session coordination contracts in the package's public API: durable records, external events,
- * request admission, runtime lifecycle and the coordination scheduler. index.ts re-exports this
- * module in one line, so new coordination exports go here.
+ * request admission, runtime lifecycle, the coordination scheduler and managed processes. index.ts
+ * re-exports this module in one line, so new coordination exports go here.
  */
 
 export { RuntimeDisposedError, RuntimeReplacementInProgressError } from "./core/agent-session-coordination.ts";
@@ -63,6 +63,36 @@ export {
 	type ExternalHistory,
 	type ProjectableExternalRecord,
 } from "./core/external-event-records.ts";
+export { readLocalProcessBirth } from "./core/managed-process-birth.ts";
+export {
+	assertExtensionManagedProcessSupport,
+	assertManagedProcessSupport,
+	MANAGED_PROCESS_CAPABILITIES,
+	type ManagedProcessSupport,
+} from "./core/managed-process-capabilities.ts";
+export type {
+	AcknowledgedAttemptImage,
+	AttemptImage,
+	AttemptIntent,
+	AttemptJournalTarget,
+	CleanupReceipt,
+	CoverageReason,
+	JournalRecord,
+	ManagedChild,
+	ManagedProcessAdapter,
+	ManagedProcesses,
+	ManagedSpawnOptions,
+	ObservedRoot,
+	ProcessAuthentication,
+	ProcessGap,
+	ProcessJournalEntry,
+	ProcessJournalPage,
+	ProcessKey,
+	ProcessProvenance,
+	ProcessSource,
+	RegistrationReceipt,
+	SpawnIntent,
+} from "./core/managed-process-types.ts";
 export {
 	assertExtensionRequestAdmissionSupport,
 	assertRequestAdmissionSupport,

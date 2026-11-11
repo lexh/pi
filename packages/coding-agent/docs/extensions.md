@@ -58,6 +58,7 @@ See [examples/extensions/](../examples/extensions/) for working implementations.
   - [Calling Other Tools](#calling-other-tools)
   - [Dynamic Tool Loading](#dynamic-tool-loading)
 - [MCP Servers](#mcp-servers)
+- [Managed Local Processes](#managed-local-processes)
 - [Custom UI](#custom-ui)
 - [Error Handling](#error-handling)
 - [Mode Behavior](#mode-behavior)
@@ -1907,6 +1908,8 @@ const result = await pi.exec("git", ["status"], { signal, timeout: 5000 });
 
 Options: `signal` and `timeout` terminate the command, `cwd` sets the working directory, and `maxBuffer` limits stdout and stderr combined (default 256 MiB). When output exceeds `maxBuffer`, pi terminates the command and returns the output up to the limit with `truncated: true`, `killed: true`, and a nonzero `code`. `killed` is true whenever pi terminated the command: timeout, abort, or `maxBuffer`. A command that ignores SIGTERM gets SIGKILL after 5 seconds. A command terminated by a signal, by pi or otherwise, reports 128 + the signal number as `code`, like a shell: 143 for SIGTERM, 137 for SIGKILL.
 
+In a session that takes part in [managed local processes](#managed-local-processes) on macOS, the command waits behind a registration gate before it runs, and a command that cannot be executed reports the shell's exit code instead of Node's spawn error. Everywhere else `pi.exec` is unchanged.
+
 ### pi.getActiveTools() / pi.getAllTools() / pi.setActiveTools(names)
 
 Manage active tools. This works for both built-in tools and dynamically registered tools. `pi.getActiveTools()` returns the active tool names as `string[]`; `pi.getAllTools()` returns metadata for all configured tools.
@@ -2812,6 +2815,48 @@ Servers registered while the extension loads connect when the session starts, to
 
 The built-in MCP support connects registered servers. When nothing does, because another extension replaced it (see [MCP](mcp.md#replace-the-built-in-mcp-support)), each registration is reported as an extension error. Other MCP extensions can connect registered servers too: read them with `pi.getMcpServers()` on `session_start` and handle the `mcp_servers_change` event for later changes.
 
+## Managed Local Processes
+
+A service that supervises local work can take part in how pi starts processes. Participation is opt-in per runtime: an integration binds an adapter through the [coordination SDK](coordination-sdk.md#managed-processes). Until it does, `pi.exec`, the built-in `bash` tool and user `!` commands behave exactly as before, and on platforms other than macOS they are never gated. This section is the extension view of the capability.
+
+Call `assertExtensionManagedProcessSupport(pi)` while the extension loads. It checks the frozen `pi.managedProcessCapabilities` descriptor (`managed-processes/1`: fd gates, `kinfo-us-v1` identity, service-cleanup retention, attributed boundary) and the own `managedProcesses` getter without invoking it. `pi.managedProcesses` and `ctx.managedProcesses` become usable only after the session binds the runner; reading them while the factory runs throws. A facade captured before a reload or session replacement cannot bind or launch afterwards.
+
+### pi.managedSpawn(command, args, options?)
+
+Starts a local process and returns a promise for `{ child, exited }`.
+
+```typescript
+const { child, exited } = await pi.managedSpawn(process.execPath, ["-e", "process.exit(0)"], {
+  signal,
+  stdio: ["ignore", "ignore", "ignore"],
+});
+const { code, signal: exitSignal } = await exited;
+```
+
+Options are `cwd`, `env`, `signal`, and exactly three `stdio` entries, each `"ignore"`, `"pipe"`, or `"inherit"`. There is no shell option, and no extra inherited descriptors are accepted. Attach data listeners to piped streams right after receiving the handle; use `"ignore"` or `"inherit"` when nothing will consume a pipe. `exited` is installed before registration and resolves to `{ code, signal }`. It is a local observation of the process pi started, not proof that its descendants are gone. See [examples/extensions/managed-spawn.ts](../examples/extensions/managed-spawn.ts).
+
+In a participating macOS session the command does not run until the process authority has registered it, or a bounded wait (1 second) passed without an answer. A service outage then lets ordinary work continue with a retained coverage gap. An explicit refusal, a cancellation, a service stop, and runtime retirement close the gate instead, and the command never runs. A late answer does not erase the interval in which the process ran unwatched.
+
+### Coverage declarations
+
+`pi.declareProcessCoverage("managed" | "no-spawn")` is a cooperative statement made by the extension's source: `"managed"` after auditing that every launch goes through `pi.exec` or `pi.managedSpawn`, `"no-spawn"` for an extension that starts no local processes. Call it before registering tools. A tool definition may also set `processCoverage` itself, which wins over the extension-wide declaration. The declaration is not containment and is never a model argument or evidence from tool events.
+
+Without it, a participating attempt records an `unsupported-tool` coverage gap for an extension that has event handlers or commands, and for each call of a tool that has no declaration. The built-in `bash`, `read`, `edit`, `write` and `ls` tools are audited already; the built-in `grep` and `find` tools, MCP-backed tools and other custom tools are not. A custom `operations` backend for `bash` or user `!` commands records `custom-operations`. Raw `child_process` calls, work handed to launchd or another pre-existing service, and extension behavior nobody examined do not gain managed coverage.
+
+### Attempts and tool calls
+
+Each claimed agent run captures one attempt, with the run's original `runId`, synchronously when the run is claimed, before preparation or model dispatch and even if the run spawns nothing. Sibling tool calls share that attempt and keep their own `toolCallId`. Independent user `!` commands, `pi.exec` and `pi.managedSpawn` calls made outside a run each get an attempt of their own with `runId` null. Calls nested inside a tool (`pi.exec`, `pi.managedSpawn`, `ctx.executeTool`) inherit the enclosing attempt and, for the spawns, the enclosing `toolCallId`; every spawn still gets a new `spawnId`. A later run never relabels an earlier asynchronous call, and `agent_settled` handlers do not inherit the attempt of the run that just ended.
+
+### Exit codes of gated commands
+
+A gated command is started by a small shell that execs it, so a target that cannot be executed reports that shell's status and diagnostic, not a Node spawn error: a missing path (a command containing a slash) exits with 126, and a missing command name exits with 127. A target that itself exits with 127 is an ordinary failure, never successful work. An ungated `pi.exec` keeps Node's behavior, including code 1 and the `ENOENT` message. No native gate or extra error channel is added to hide this difference.
+
+### Service stop
+
+`requestStop(attemptId, stopId)` on the managed process facade targets one attempt. It returns `{ requested: true, settled }` synchronously, closes unreleased gates, and cancels local work without sending any pi signal ahead of the service's own TERM, grace period and escalation. Acknowledge `requested` to the service immediately; waiting for `settled` first would deadlock a command whose output waiter correctly waits for the service-driven exit. An ordinary user Escape keeps pi's local interruption behavior.
+
+Stopped covers attributable processes only. Work delegated to launchd or another pre-existing service is outside that boundary.
+
 <a id="interact-with-the-user"></a>
 
 ## Custom UI
@@ -3290,6 +3335,7 @@ All examples in [examples/extensions/](../examples/extensions/).
 | `tool-override.ts` | Override built-in read tool | `registerTool` (same name as built-in) |
 | `built-in-tool-renderer.ts` | Custom rendering for built-in tools | `create*ToolDefinition`, `renderCall`, `renderResult`, `renderShell` |
 | `minimal-mode.ts` | Collapsed display for built-in tools | Built-in tool overrides, `renderResult` |
+| `managed-spawn.ts` | Tool that starts a local process through managed registration | `registerTool`, `managedSpawn`, `declareProcessCoverage` |
 | **Commands** |||
 | `pirate.ts` | Modify system prompt per-turn | `registerCommand`, `before_agent_start` |
 | `summarize.ts` | Conversation summary command | `registerCommand`, `ui.custom` |
