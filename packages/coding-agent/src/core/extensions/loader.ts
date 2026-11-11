@@ -3,6 +3,7 @@
  *
  */
 
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import { createRequire } from "node:module";
 import * as path from "node:path";
@@ -18,6 +19,8 @@ import { createEventBus, type EventBus } from "../event-bus.ts";
 import type { ExecOptions } from "../exec.ts";
 import { execCommand } from "../exec.ts";
 import { EXTERNAL_EVENT_CAPABILITIES } from "../external-event-capabilities.ts";
+import { MANAGED_PROCESS_CAPABILITIES } from "../managed-process-capabilities.ts";
+import type { ManagedSpawnOptions } from "../managed-process-types.ts";
 import { type McpServerConfig, McpServerRegistry, validateMcpServerConfig } from "../mcp-servers.ts";
 import { readPiManifest } from "../pi-manifest.ts";
 import { REQUEST_ADMISSION_CAPABILITIES } from "../request-admission-capabilities.ts";
@@ -185,6 +188,9 @@ export function createExtensionRuntime(): ExtensionRuntime {
 		getRuntimeLifecycle: notInitialized,
 		getRequestAdmission: notInitialized,
 		getCoordinationScheduler: notInitialized,
+		getManagedProcessOwner: notInitialized,
+		managedProcessOwnerReady: false,
+		captureManagedTool: () => undefined,
 		setSessionName: notInitialized,
 		getSessionName: notInitialized,
 		setLabel: notInitialized,
@@ -297,6 +303,19 @@ function createExtensionAPI(
 		runtimeLifecycleCapabilities: RUNTIME_LIFECYCLE_CAPABILITIES,
 		requestAdmissionCapabilities: REQUEST_ADMISSION_CAPABILITIES,
 		coordinationSchedulerCapabilities: COORDINATION_SCHEDULER_CAPABILITIES,
+		managedProcessCapabilities: MANAGED_PROCESS_CAPABILITIES,
+		get managedProcesses() {
+			assertActive();
+			return runtime.getManagedProcessOwner().facade;
+		},
+		managedSpawn(command: string, args: readonly string[], options?: ManagedSpawnOptions) {
+			assertActive();
+			return runtime.getManagedProcessOwner().facade.managedSpawn(command, args, options);
+		},
+		declareProcessCoverage(coverage: "no-spawn" | "managed") {
+			assertActive();
+			extension.processCoverage = coverage;
+		},
 		// Registration methods - write to extension
 		on(event: string, handler: HandlerFn): () => void {
 			assertActive();
@@ -323,7 +342,11 @@ function createExtensionAPI(
 				);
 			}
 			extension.tools.set(tool.name, {
-				definition: tool,
+				// The extension-wide declaration applies to tools registered after it; a tool's own wins.
+				definition:
+					tool.processCoverage || !extension.processCoverage
+						? tool
+						: { ...tool, processCoverage: extension.processCoverage },
 				sourceInfo: extension.sourceInfo,
 			});
 			runtime.refreshTools();
@@ -452,7 +475,16 @@ function createExtensionAPI(
 
 		exec(command: string, args: string[], options?: ExecOptions) {
 			assertActive();
-			return execCommand(command, args, options?.cwd ?? cwd, options);
+			// Before a session binds its owner, and outside participation, exec keeps its ordinary behavior.
+			if (!runtime.managedProcessOwnerReady) return execCommand(command, args, options?.cwd ?? cwd, options);
+			const controller = new AbortController();
+			const signal = options?.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal;
+			return runtime.getManagedProcessOwner().run(
+				"pi-exec",
+				randomUUID(),
+				() => controller.abort(),
+				() => execCommand(command, args, options?.cwd ?? cwd, { ...options, signal }),
+			);
 		},
 
 		getActiveTools(): string[] {

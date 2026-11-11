@@ -13,6 +13,7 @@
  * Modes use this class and add their own I/O layer on top.
  */
 
+import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { basename, dirname } from "node:path";
 import {
@@ -75,11 +76,14 @@ import {
 	type CoordinationScheduler,
 	CoordinationSchedulerOwner,
 	createUnavailableRuntimeLifecycle,
+	currentManagedCall,
 	EXTERNAL_EVENT_CAPABILITIES,
 	type ExtensionCoordinationActions,
 	type ExternalEventDisplayItem,
 	ExternalEventReconciler,
 	type ExternalEventRefresh,
+	MANAGED_PROCESS_CAPABILITIES,
+	ManagedProcessOwner,
 	newCoordinationRunId,
 	type PrepareRequestContext,
 	REQUEST_ADMISSION_CAPABILITIES,
@@ -93,7 +97,9 @@ import {
 	readExternalEntry,
 	resolveConversationBinding,
 	runtimeHost,
+	toolSource,
 	type WakeClaim,
+	withManagedCall,
 } from "./agent-session-coordination.ts";
 import { formatNoApiKeyFoundMessage, formatNoModelSelectedMessage } from "./auth-guidance.ts";
 import { type BashResult, executeBashWithOperations } from "./bash-executor.ts";
@@ -448,6 +454,8 @@ export class AgentSession {
 	readonly runtimeLifecycleCapabilities = RUNTIME_LIFECYCLE_CAPABILITIES;
 	readonly requestAdmissionCapabilities = REQUEST_ADMISSION_CAPABILITIES;
 	readonly coordinationSchedulerCapabilities = COORDINATION_SCHEDULER_CAPABILITIES;
+	readonly managedProcessCapabilities = MANAGED_PROCESS_CAPABILITIES;
+	private _managedProcesses!: ManagedProcessOwner;
 	private _runtimeLifecycle!: RuntimeLifecycle;
 	private _runtimeIncarnation?: RuntimeIncarnation;
 	private _requestAdmission!: RequestAdmissionOwner;
@@ -489,10 +497,12 @@ export class AgentSession {
 		this._firstUnsentEntryId = undefined;
 		this._coordinationRunId = newCoordinationRunId();
 		this._coordinationContinuationSuppressed = false;
+		this._managedProcesses.claimRun(this._coordinationRunId);
 	}
 
 	private _settleCoordination(): void {
 		this._coordinationScheduler.clearAllSettledTickets();
+		this._managedProcesses.settleRun();
 		this._coordinationRunId = undefined;
 	}
 
@@ -533,7 +543,10 @@ export class AgentSession {
 	/** Coordination facades for a runner; the lifecycle stays the one current at bind time. */
 	private _extensionCoordinationActions(): ExtensionCoordinationActions {
 		const lifecycle = this.runtimeLifecycle;
+		const managed = this._managedProcesses;
 		return {
+			getManagedProcessOwner: () => managed,
+			captureManagedTool: (id, source) => managed.toolContext(id, source),
 			refreshExternalEvents: (update) => this.refreshExternalEvents(update),
 			getRuntimeLifecycle: () => lifecycle,
 			getRequestAdmission: () => this._requestAdmission,
@@ -568,6 +581,17 @@ export class AgentSession {
 				error instanceof Error ? error.message : String(error),
 			);
 		}
+		this._managedProcesses = new ManagedProcessOwner(
+			this._runtimeHost,
+			this._runtimeLifecycle,
+			async (attemptId) => {
+				// Only the attempt of the claimed run can be aborted here; standalone attempts cancel through the registry.
+				if (this._managedProcesses.attemptId !== attemptId || !this._isAgentRunActive) return;
+				this._coordinationContinuationSuppressed = true;
+				await this.abort();
+			},
+			(context) => this._extensionRunner.markManagedCoverage(context),
+		);
 		this._coordinationScheduler = new CoordinationSchedulerOwner(
 			this._runtimeLifecycle,
 			undefined,
@@ -644,6 +668,16 @@ export class AgentSession {
 		return this._runtimeLifecycle;
 	}
 
+	/** Managed process facade for the current runtime incarnation. */
+	get managedProcesses() {
+		return this._managedProcesses.facade;
+	}
+
+	/** The attempt of the run being claimed, for the process authority's stop and finalization. */
+	get managedAttemptId(): string | undefined {
+		return this._managedProcesses.attemptId;
+	}
+
 	get isDisposed(): boolean {
 		return this._disposed;
 	}
@@ -693,6 +727,7 @@ export class AgentSession {
 	}
 
 	retireRuntime(reason: "new" | "resume" | "fork" | "reload" | "quit"): void {
+		this._managedProcesses.retire();
 		this._coordinationScheduler?.retire();
 		this._requestAdmission.retire();
 		this._runtimeIncarnation?.retire(reason);
@@ -823,6 +858,7 @@ export class AgentSession {
 		this._firstUnsentEntryId = undefined;
 		this._coordinationRunId = newCoordinationRunId();
 		this._coordinationContinuationSuppressed = false;
+		this._managedProcesses.claimRun(this._coordinationRunId);
 
 		this._coordinationScheduler.startClaim(claim);
 		let updateMessage: AgentMessage | undefined;
@@ -839,6 +875,7 @@ export class AgentSession {
 		} catch (error) {
 			this._coordinationScheduler.blocked(claim, "wake-blocked");
 			this._isAgentRunActive = false;
+			this._managedProcesses.settleRun();
 			this._coordinationRunId = undefined;
 			this._runSystemPromptOptions = undefined;
 			this._emit({
@@ -1174,7 +1211,16 @@ export class AgentSession {
 	}
 
 	/** `tool_call` handlers. `parentToolCallId` is set for calls another tool made. */
-	private async _beforeToolCall(
+	private _beforeToolCall(
+		context: BeforeToolCallContext,
+		parentToolCallId?: string,
+	): Promise<BeforeToolCallResult | undefined> {
+		// Handlers run in the call's managed scope, captured before any of them is awaited.
+		const captured = this._managedProcesses.hookContext(context.toolCall.id, toolSource(context.toolCall.name));
+		return withManagedCall(captured, () => this._beforeToolCallCaptured(context, parentToolCallId));
+	}
+
+	private async _beforeToolCallCaptured(
 		{ toolCall, args }: BeforeToolCallContext,
 		parentToolCallId?: string,
 	): Promise<BeforeToolCallResult | undefined> {
@@ -1200,7 +1246,15 @@ export class AgentSession {
 	}
 
 	/** `tool_result` handlers and image normalization. `parentToolCallId` is set for calls another tool made. */
-	private async _afterToolCall(
+	private _afterToolCall(
+		context: AfterToolCallContext,
+		parentToolCallId?: string,
+	): Promise<AfterToolCallResult | undefined> {
+		const captured = this._managedProcesses.hookContext(context.toolCall.id, toolSource(context.toolCall.name));
+		return withManagedCall(captured, () => this._afterToolCallCaptured(context, parentToolCallId));
+	}
+
+	private async _afterToolCallCaptured(
 		{ toolCall, args, result, isError }: AfterToolCallContext,
 		parentToolCallId?: string,
 	): Promise<AfterToolCallResult | undefined> {
@@ -2433,6 +2487,7 @@ export class AgentSession {
 			messages = await this._prepareRun(trigger);
 		} catch (error) {
 			this._isAgentRunActive = false;
+			this._managedProcesses.settleRun();
 			this._flushPendingBashMessages();
 			this._flushPendingCustomMessages();
 			this._resolveIdleWaitIfIdle();
@@ -2454,7 +2509,12 @@ export class AgentSession {
 		await this._driveAgentRun(() => this.agent.prompt(messages));
 	}
 
-	private async _driveAgentRun(initialRequest: () => Promise<void>): Promise<void> {
+	private _driveAgentRun(initialRequest: () => Promise<void>): Promise<void> {
+		// The whole loop runs in the claimed run's managed scope, so tools and handlers inherit its attempt.
+		return withManagedCall(this._managedProcesses.runContext, () => this._driveAgentRunCaptured(initialRequest));
+	}
+
+	private async _driveAgentRunCaptured(initialRequest: () => Promise<void>): Promise<void> {
 		try {
 			await initialRequest();
 			while (
@@ -2486,7 +2546,8 @@ export class AgentSession {
 			this._runSystemPromptOptions = undefined;
 			this._flushPendingBashMessages();
 			this._flushPendingCustomMessages();
-			await this._emitAgentSettled();
+			// The attempt ended with the run: agent_settled handlers must not inherit its scope.
+			await withManagedCall(undefined, () => this._emitAgentSettled());
 		}
 	}
 
@@ -2496,7 +2557,11 @@ export class AgentSession {
 	 * message followed by pending nextTurn messages (consumed here) and handler messages, with a
 	 * system patch first when the prompt changed.
 	 */
-	private async _prepareRun(trigger: BeforeAgentStartTrigger): Promise<AgentMessage[]> {
+	private _prepareRun(trigger: BeforeAgentStartTrigger): Promise<AgentMessage[]> {
+		return withManagedCall(this._managedProcesses.runContext, () => this._prepareRunCaptured(trigger));
+	}
+
+	private async _prepareRunCaptured(trigger: BeforeAgentStartTrigger): Promise<AgentMessage[]> {
 		// Check if we need to compact before sending (catches aborted responses).
 		// The starting message is sent below, so do not call agent.continue() here.
 		const lastAssistant = this._findLastAssistantMessage();
@@ -4621,21 +4686,30 @@ export class AgentSession {
 		const resolvedCommand = prefix ? `${prefix}\n${command}` : command;
 
 		try {
-			const result = await executeBashWithOperations(
-				resolvedCommand,
-				this.sessionManager.getCwd(),
-				options?.operations ?? createLocalBashOperations({ shellPath }),
-				{
-					onChunk: (delta) => {
-						onChunk?.(delta);
-						this._emit({ type: "bash_execution_update", id: options?.id, delta });
-					},
-					signal: abortController.signal,
+			return await this._managedProcesses.run(
+				"user-bash",
+				options?.id ?? randomUUID(),
+				() => abortController.abort(),
+				async () => {
+					const context = currentManagedCall();
+					if (context && options?.operations) context.attempt.registry.gap(context, "custom-operations");
+					const result = await executeBashWithOperations(
+						resolvedCommand,
+						this.sessionManager.getCwd(),
+						options?.operations ?? createLocalBashOperations({ shellPath }),
+						{
+							onChunk: (delta) => {
+								onChunk?.(delta);
+								this._emit({ type: "bash_execution_update", id: options?.id, delta });
+							},
+							signal: abortController.signal,
+						},
+					);
+
+					this.recordBashResult(command, result, options);
+					return result;
 				},
 			);
-
-			this.recordBashResult(command, result, options);
-			return result;
 		} finally {
 			this._bashAbortControllers.delete(abortController);
 		}

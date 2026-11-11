@@ -1,8 +1,14 @@
 import type { ExtensionCoordinationActions } from "../../src/core/extensions/runner.ts";
+import { ManagedProcessOwner } from "../../src/core/managed-process-owner.ts";
 import { createUnavailableRuntimeLifecycle } from "../../src/core/runtime-incarnation.ts";
+
+/** An owner nothing binds to: runs, tools and spawns stay ordinary. */
+const inertManaged = new ManagedProcessOwner(undefined, createUnavailableRuntimeLifecycle("test"), async () => {});
 
 /** Inert coordination actions for tests that bind a runner by hand: nothing is bound or coordinated. */
 export const coordinationExtensionActions: ExtensionCoordinationActions = {
+	getManagedProcessOwner: () => inertManaged,
+	captureManagedTool: () => undefined,
 	refreshExternalEvents: () => true,
 	getRuntimeLifecycle: () => createUnavailableRuntimeLifecycle("test"),
 	getRequestAdmission: () => ({ bind: () => () => {}, stageCompletedWait: () => {}, reconcile: async () => {} }),

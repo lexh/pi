@@ -69,6 +69,10 @@ import type { EXTERNAL_EVENT_CAPABILITIES } from "../external-event-capabilities
 import type { ExternalEventRefresh } from "../external-event-reconciliation.ts";
 import type { ReadonlyFooterDataProvider } from "../footer-data-provider.ts";
 import type { KeybindingsManager } from "../keybindings.ts";
+import type { MANAGED_PROCESS_CAPABILITIES } from "../managed-process-capabilities.ts";
+import type { ManagedCallContext } from "../managed-process-context.ts";
+import type { ManagedProcessOwner } from "../managed-process-owner.ts";
+import type { ManagedChild, ManagedProcesses, ManagedSpawnOptions, ProcessSource } from "../managed-process-types.ts";
 import type { McpServerConfig, McpServerRegistry, RegisteredMcpServer } from "../mcp-servers.ts";
 import type { CustomMessage } from "../messages.ts";
 import type { ModelRegistry } from "../model-registry.ts";
@@ -356,6 +360,8 @@ export interface ExtensionContext {
 	readonly requestAdmission: RequestAdmission;
 	/** Coordination scheduler facade for the current runtime incarnation. */
 	readonly coordinationScheduler: CoordinationScheduler;
+	/** Managed process facade for the current runtime incarnation. */
+	readonly managedProcesses: ManagedProcesses;
 	/** UI methods for user interaction */
 	ui: ExtensionUIContext;
 	/** Current run mode. Use "tui" to guard terminal-only UI such as custom components. */
@@ -622,6 +628,12 @@ export interface ToolDefinition<TParams extends TSchema = TSchema, TDetails = un
 	promptGuidelines?: string[];
 	/** Parameter schema (TypeBox) */
 	parameters: TParams;
+	/**
+	 * Audited cooperative source declaration: `"managed"` when every local process this tool starts goes through
+	 * `managedSpawn`/`exec`, `"no-spawn"` when it starts none. Not containment, and never a model-supplied assertion.
+	 * Without it a participating attempt records an `unsupported-tool` coverage gap for each call.
+	 */
+	processCoverage?: "no-spawn" | "managed";
 	/** Optional provider-side constrained sampling request for this tool. Set false to explicitly disable it, equivalent to leaving it undefined. */
 	constrainedSampling?: false | ConstrainedSamplingConfig;
 	/** Controls whether ToolExecutionComponent renders the standard colored shell or the tool renders its own framing. */
@@ -1656,6 +1668,16 @@ export interface ExtensionAPI {
 	readonly runtimeLifecycleCapabilities: typeof RUNTIME_LIFECYCLE_CAPABILITIES;
 	readonly requestAdmissionCapabilities: typeof REQUEST_ADMISSION_CAPABILITIES;
 	readonly coordinationSchedulerCapabilities: typeof COORDINATION_SCHEDULER_CAPABILITIES;
+	readonly managedProcessCapabilities: typeof MANAGED_PROCESS_CAPABILITIES;
+	/** Managed process facade for the current runtime incarnation. Not usable while extensions load. */
+	readonly managedProcesses: ManagedProcesses;
+	/** Spawn a local process that is registered with the process authority before its command may run. */
+	managedSpawn(command: string, args: readonly string[], options?: ManagedSpawnOptions): Promise<ManagedChild>;
+	/**
+	 * Declare, after auditing every launch in this extension's source, that it starts local processes only through
+	 * managed spawns (`"managed"`) or not at all (`"no-spawn"`). Call it before registering tools.
+	 */
+	declareProcessCoverage(coverage: "no-spawn" | "managed"): void;
 	// =========================================================================
 	// Event Subscription
 	// =========================================================================
@@ -2339,6 +2361,10 @@ export interface ExtensionRuntimeCoordination {
 	getRuntimeLifecycle: () => RuntimeLifecycle;
 	getRequestAdmission: () => RequestAdmission;
 	getCoordinationScheduler: () => CoordinationScheduler;
+	getManagedProcessOwner: () => ManagedProcessOwner;
+	/** True once a session has bound its owner; before that `pi.exec` keeps its ordinary behavior. */
+	managedProcessOwnerReady: boolean;
+	captureManagedTool: (toolCallId: string, source: ProcessSource) => ManagedCallContext | undefined;
 }
 
 /**
@@ -2354,6 +2380,8 @@ export interface Extension {
 	hidden?: boolean;
 	/** See {@link InlineExtension}. */
 	replaceable?: boolean;
+	/** Declared with `declareProcessCoverage()`. */
+	processCoverage?: "no-spawn" | "managed";
 	sourceInfo: SourceInfo;
 	handlers: Map<string, HandlerFn[]>;
 	tools: Map<string, RegisteredTool>;

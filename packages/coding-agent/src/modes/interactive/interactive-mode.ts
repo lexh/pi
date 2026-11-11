@@ -2403,6 +2403,9 @@ export class InteractiveMode {
 			get coordinationScheduler() {
 				return extensionRunner.createContext().coordinationScheduler;
 			},
+			get managedProcesses() {
+				return extensionRunner.createContext().managedProcesses;
+			},
 			get ui() {
 				return extensionRunner.createCommandContext().ui;
 			},

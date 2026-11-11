@@ -18,6 +18,9 @@ export { assertExternalEventProjectionSupport, EXTERNAL_EVENT_CAPABILITIES } fro
 export { buildExternalEventDisplay, type ExternalEventDisplayItem } from "./external-event-projection.ts";
 export { ExternalEventReconciler, type ExternalEventRefresh } from "./external-event-reconciliation.ts";
 export { readExternalEntry } from "./external-event-records.ts";
+export { MANAGED_PROCESS_CAPABILITIES } from "./managed-process-capabilities.ts";
+export { currentManagedCall, toolSource, withManagedCall } from "./managed-process-context.ts";
+export { ManagedProcessOwner } from "./managed-process-owner.ts";
 export { RequestAdmissionOwner } from "./request-admission.ts";
 export { assertRequestAdmissionSupport, REQUEST_ADMISSION_CAPABILITIES } from "./request-admission-capabilities.ts";
 export type { RequestAdmission } from "./request-admission-types.ts";

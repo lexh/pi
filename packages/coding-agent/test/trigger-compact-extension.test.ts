@@ -6,6 +6,7 @@ function createContext(tokens: number | null, compact = vi.fn()): ExtensionConte
 	return {
 		requestAdmission: {} as ExtensionContext["requestAdmission"],
 		coordinationScheduler: {} as ExtensionContext["coordinationScheduler"],
+		managedProcesses: {} as ExtensionContext["managedProcesses"],
 		mode: "print",
 		hasUI: false,
 		ui: {} as ExtensionContext["ui"],

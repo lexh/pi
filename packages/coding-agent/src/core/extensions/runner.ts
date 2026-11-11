@@ -17,6 +17,8 @@ import type { HoldMode } from "../coordination-scheduler.ts";
 import type { CoordinationGate } from "../coordination-scheduler-types.ts";
 import type { ResourceDiagnostic } from "../diagnostics.ts";
 import type { KeybindingsConfig } from "../keybindings.ts";
+import type { ManagedCallContext } from "../managed-process-context.ts";
+import type { ProcessSource } from "../managed-process-types.ts";
 import type { ModelRegistry } from "../model-registry.ts";
 import type { ScopedModel } from "../model-resolver.ts";
 import type { SessionManager } from "../session-manager.ts";
@@ -264,7 +266,12 @@ type ContextOwner = { kind: "user" } | { kind: "model"; runId: string };
 export interface ExtensionCoordinationActions
 	extends Pick<
 		ExtensionRuntime,
-		"refreshExternalEvents" | "getRuntimeLifecycle" | "getRequestAdmission" | "getCoordinationScheduler"
+		| "refreshExternalEvents"
+		| "getRuntimeLifecycle"
+		| "getRequestAdmission"
+		| "getCoordinationScheduler"
+		| "getManagedProcessOwner"
+		| "captureManagedTool"
 	> {
 	/** Acquires an internal coordination hold token for gate arbitration. */
 	holdCoordination?: (gate: CoordinationGate, mode: HoldMode) => () => void;
@@ -568,6 +575,12 @@ export class ExtensionRunner {
 			this.assertActive();
 			return actions.getCoordinationScheduler();
 		};
+		this.runtime.getManagedProcessOwner = () => {
+			this.assertActive();
+			return actions.getManagedProcessOwner();
+		};
+		this.runtime.managedProcessOwnerReady = true;
+		this.runtime.captureManagedTool = actions.captureManagedTool;
 		this.holdCoordinationFn = actions.holdCoordination;
 		this.getCoordinationRunIdFn = actions.getCoordinationRunId;
 	}
@@ -1078,6 +1091,10 @@ export class ExtensionRunner {
 				runner.assertActive();
 				return runner.runtime.getCoordinationScheduler();
 			},
+			get managedProcesses() {
+				runner.assertActive();
+				return runner.runtime.getManagedProcessOwner().facade;
+			},
 			get ui() {
 				runner.assertActive();
 				const runId = capturedOwner ? capturedOwner.runId : runner.getCoordinationRunIdFn?.();
@@ -1159,6 +1176,27 @@ export class ExtensionRunner {
 				return runner.getSystemPromptFn();
 			},
 		};
+	}
+
+	/**
+	 * Record a coverage gap on a new attempt for each extension that has handlers or commands but no audited
+	 * `declareProcessCoverage()`: its startup, event and command code may start processes unregistered.
+	 */
+	markManagedCoverage(context: ManagedCallContext | undefined): void {
+		if (!context) return;
+		for (const [index, extension] of this.extensions.entries()) {
+			if (!extension.processCoverage && (extension.handlers.size || extension.commands.size)) {
+				context.attempt.registry.gap(
+					{ ...context, source: "extension", toolCallId: `${context.toolCallId}:extension:${index}` },
+					"unsupported-tool",
+				);
+			}
+		}
+	}
+
+	captureManagedTool(toolCallId: string, source: ProcessSource): ManagedCallContext | undefined {
+		this.assertActive();
+		return this.runtime.captureManagedTool(toolCallId, source);
 	}
 
 	/**

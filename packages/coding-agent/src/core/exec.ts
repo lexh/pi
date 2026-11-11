@@ -3,10 +3,10 @@
  */
 
 import { constants as bufferConstants } from "node:buffer";
-import { spawn } from "node:child_process";
 import { constants as osConstants } from "node:os";
 import { StringDecoder } from "node:string_decoder";
 import { waitForChildProcess } from "../utils/child-process.ts";
+import { launchManaged } from "./managed-process-launch.ts";
 
 const DEFAULT_EXEC_MAX_BUFFER = Math.min(256 * 1024 * 1024, bufferConstants.MAX_STRING_LENGTH);
 const FORCE_KILL_DELAY_MS = 5000;
@@ -57,11 +57,12 @@ export async function execCommand(
 		throw new RangeError(`maxBuffer must be an integer between 0 and ${bufferConstants.MAX_STRING_LENGTH} bytes`);
 	}
 
-	const proc = spawn(command, args, {
+	const launch = launchManaged(command, args, {
 		cwd,
 		shell: false,
 		stdio: ["ignore", "pipe", "pipe"],
 	});
+	const proc = launch.child;
 
 	let stdout = "";
 	let stderr = "";
@@ -76,12 +77,15 @@ export async function execCommand(
 	let forceKillId: NodeJS.Timeout | undefined;
 
 	const killProcess = () => {
+		launch.cancelGate();
 		if (killed) return;
 		killed = true;
+		// A service stop owns termination: no pi signal may preempt its grace period.
+		if (launch.defersSignals()) return;
 		proc.kill("SIGTERM");
 		forceKillId = setTimeout(() => {
 			// `proc.killed` only says a signal was sent, so check whether the child actually exited.
-			if (proc.exitCode === null && proc.signalCode === null) {
+			if (!launch.defersSignals() && proc.exitCode === null && proc.signalCode === null) {
 				proc.kill("SIGKILL");
 			}
 		}, FORCE_KILL_DELAY_MS);
@@ -129,13 +133,17 @@ export async function execCommand(
 	let code: number | null;
 	try {
 		// Do not hang on inherited stdio handles held open by detached descendants.
-		code = await waitForChildProcess(proc);
+		const completion = waitForChildProcess(proc);
+		void completion.catch(() => {});
+		await launch.registered;
+		code = await completion;
 	} catch (error) {
 		if (!(error instanceof Error)) throw error;
 		// Child-process errors (e.g. ENOENT) are failed executions, not host failures.
 		code = 1;
 		if (!stderr) stderr = error.message;
 	} finally {
+		launch.ended(killed || options?.signal?.aborted === true);
 		clearTimeout(timeoutId);
 		clearTimeout(forceKillId);
 		options?.signal?.removeEventListener("abort", killProcess);

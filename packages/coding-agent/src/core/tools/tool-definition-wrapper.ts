@@ -1,6 +1,7 @@
 import type { AgentTool, AgentToolResult, AgentToolUpdateCallback } from "@earendil-works/pi-agent-core";
 import type { Static, TSchema } from "typebox";
 import type { ExtensionToolContext, ToolDefinition } from "../extensions/types.ts";
+import { currentManagedCall, type ManagedCallContext, managedActivity } from "../managed-process-context.ts";
 
 /**
  * An `AgentTool` with a TypeBox parameter schema whose `execute` and `prepareArguments` are typed by TypeBox's
@@ -23,10 +24,20 @@ export type TypeBoxAgentTool<TParams extends TSchema = TSchema, TDetails = any> 
 /** Creates the context for one tool call. */
 export type ToolContextFactory = (toolCallId: string, signal: AbortSignal | undefined) => ExtensionToolContext;
 
-/** Wrap a ToolDefinition into an AgentTool for the core runtime. */
+/**
+ * Allocates or inherits the managed process scope of one tool call. It is invoked synchronously, once per execute,
+ * before the context is created or anything is awaited.
+ */
+export type ManagedContextFactory = (toolCallId: string) => ManagedCallContext | undefined;
+
+/**
+ * Wrap a ToolDefinition into an AgentTool for the core runtime. Without `managedFactory` a call inherits the
+ * enclosing managed scope, if any, instead of allocating another attempt.
+ */
 export function wrapToolDefinition<TDetails = unknown>(
 	definition: ToolDefinition<any, TDetails>,
 	ctxFactory?: ToolContextFactory,
+	managedFactory?: ManagedContextFactory,
 ): AgentTool<any, TDetails> {
 	return {
 		name: definition.name,
@@ -37,14 +48,31 @@ export function wrapToolDefinition<TDetails = unknown>(
 		constrainedSampling: definition.constrainedSampling,
 		prepareArguments: definition.prepareArguments,
 		executionMode: definition.executionMode,
-		execute: (toolCallId, params, signal, onUpdate, ctx?: ExtensionToolContext) =>
-			definition.execute(
-				toolCallId,
-				params,
-				signal,
-				onUpdate,
-				ctx ?? (ctxFactory?.(toolCallId, signal) as ExtensionToolContext),
-			),
+		execute: (toolCallId, params, signal, onUpdate, ctx?: ExtensionToolContext) => {
+			const created = managedFactory?.(toolCallId);
+			const managed = created ?? currentManagedCall();
+			if (!managed) {
+				return definition.execute(
+					toolCallId,
+					params,
+					signal,
+					onUpdate,
+					ctx ?? (ctxFactory?.(toolCallId, signal) as ExtensionToolContext),
+				);
+			}
+			// A service stop cancels the call through this controller.
+			const controller = new AbortController();
+			const effectiveSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+			const context = ctx ?? (ctxFactory?.(toolCallId, effectiveSignal) as ExtensionToolContext);
+			return managedActivity(
+				managed,
+				() => controller.abort(),
+				() => definition.execute(toolCallId, params, effectiveSignal, onUpdate, context),
+			).finally(() => {
+				// Only an attempt allocated for this very call ends with it.
+				if (created?.standalone) created.attempt.registry.end(created.attempt);
+			});
+		},
 	};
 }
 

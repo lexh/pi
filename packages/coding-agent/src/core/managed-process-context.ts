@@ -34,9 +34,17 @@ function contexts(): AsyncLocalStorage<ManagedCallContext | undefined> {
 		return ordinaryContexts;
 	}
 }
+/** The process source a tool's own spawns are attributed to: the built-in shell tool is `bash`. */
+export function toolSource(toolName: string): ProcessSource {
+	return toolName === "bash" ? "bash" : "extension";
+}
 export const currentManagedCall = (): ManagedCallContext | undefined => contexts().getStore();
+/** Runs `action` inside `context`; `undefined` leaves any enclosing scope. */
 export function withManagedCall<T>(context: ManagedCallContext | undefined, action: () => T): T {
-	return contexts().run(context, action);
+	const storage = contexts();
+	// Ordinary pi has no scope to enter or leave: skip the async context frame.
+	if (!context && !storage.getStore()) return action();
+	return storage.run(context, action);
 }
 export function managedActivity<T>(
 	context: ManagedCallContext | undefined,

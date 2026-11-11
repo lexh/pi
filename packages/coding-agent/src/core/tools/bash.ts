@@ -1,7 +1,6 @@
 import { constants } from "node:fs";
 import { access as fsAccess } from "node:fs/promises";
 import { constants as osConstants } from "node:os";
-import { spawn } from "child_process";
 import { type Static, Type } from "typebox";
 import { waitForChildProcess } from "../../utils/child-process.ts";
 import {
@@ -13,6 +12,8 @@ import {
 	untrackDetachedChildPid,
 } from "../../utils/shell.ts";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.ts";
+import { currentManagedCall } from "../managed-process-context.ts";
+import { launchManaged } from "../managed-process-launch.ts";
 import { OutputAccumulator } from "./output-accumulator.ts";
 import { BASH_UPDATE_THROTTLE_MS, createShellRenderers } from "./renderers/bash.ts";
 import { type TypeBoxAgentTool, wrapToolDefinition } from "./tool-definition-wrapper.ts";
@@ -122,13 +123,18 @@ export function createLocalShellOperations(shellName: string, resolveShellConfig
 			}
 
 			const commandFromStdin = shellConfig.commandTransport === "stdin";
-			const child = spawn(shellConfig.shell, commandFromStdin ? shellConfig.args : [...shellConfig.args, command], {
-				cwd,
-				detached: process.platform !== "win32",
-				env: env ?? getShellEnv(),
-				stdio: [commandFromStdin ? "pipe" : "ignore", "pipe", "pipe"],
-				windowsHide: true,
-			});
+			const launch = launchManaged(
+				shellConfig.shell,
+				commandFromStdin ? shellConfig.args : [...shellConfig.args, command],
+				{
+					cwd,
+					detached: process.platform !== "win32",
+					env: env ?? getShellEnv(),
+					stdio: [commandFromStdin ? "pipe" : "ignore", "pipe", "pipe"],
+					windowsHide: true,
+				},
+			);
+			const child = launch.child;
 			if (commandFromStdin) {
 				child.stdin?.on("error", () => {});
 				child.stdin?.end(command);
@@ -143,7 +149,11 @@ export function createLocalShellOperations(shellName: string, resolveShellConfig
 			let exitedBeforeDeadlineAfterMs: number | undefined;
 			let timeoutHandle: NodeJS.Timeout | undefined;
 			const onAbort = () => {
-				if (child.pid) killProcessTree(child.pid);
+				launch.cancelGate();
+				if (!child.pid) return;
+				// A service stop owns termination: leave the process tree to its grace period and escalation.
+				if (launch.defersSignals()) untrackDetachedChildPid(child.pid);
+				else killProcessTree(child.pid);
 			};
 
 			try {
@@ -154,7 +164,7 @@ export function createLocalShellOperations(shellName: string, resolveShellConfig
 						exitedBeforeDeadlineAfterMs = shellExitedAfterMs;
 						// Also when the shell already exited: on Unix the group kill still reaches background
 						// processes holding the pipes. Windows cannot find them once the shell pid is gone.
-						if (child.pid) killProcessTree(child.pid);
+						onAbort();
 					}, timeoutMs);
 				}
 				// Stream stdout and stderr.
@@ -167,7 +177,10 @@ export function createLocalShellOperations(shellName: string, resolveShellConfig
 				}
 				// Handle shell spawn errors and wait for the process to terminate without hanging
 				// on inherited stdio handles held by detached descendants.
-				const exitCode = await waitForChildProcess(child);
+				const completion = waitForChildProcess(child);
+				void completion.catch(() => {});
+				await launch.registered;
+				const exitCode = await completion;
 				if (signal?.aborted) {
 					throw new Error("aborted");
 				}
@@ -185,6 +198,7 @@ export function createLocalShellOperations(shellName: string, resolveShellConfig
 				}
 				return { exitCode: resolvedExitCode };
 			} finally {
+				launch.ended(timedOut || signal?.aborted === true);
 				if (child.pid) untrackDetachedChildPid(child.pid);
 				if (timeoutHandle) clearTimeout(timeoutHandle);
 				if (signal) signal.removeEventListener("abort", onAbort);
@@ -389,6 +403,8 @@ export function createShellToolDefinition(
 			try {
 				let exitCode: number | null;
 				try {
+					const managed = currentManagedCall();
+					if (options?.operations && managed) managed.attempt.registry.gap(managed, "custom-operations");
 					const result = await ops.exec(spawnContext.command, spawnContext.cwd, {
 						onData: handleData,
 						signal,

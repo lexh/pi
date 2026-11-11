@@ -6,6 +6,7 @@
  */
 
 import type { AgentTool } from "@earendil-works/pi-agent-core";
+import { toolSource } from "../managed-process-context.ts";
 import { wrapToolDefinition } from "../tools/tool-definition-wrapper.ts";
 import type { ExtensionRunner } from "./runner.ts";
 import type { RegisteredTool } from "./types.ts";
@@ -15,8 +16,19 @@ import type { RegisteredTool } from "./types.ts";
  * Uses the runner's createToolContext() for consistent context across tools and event handlers.
  */
 export function wrapRegisteredTool(registeredTool: RegisteredTool, runner: ExtensionRunner): AgentTool {
-	return wrapToolDefinition(registeredTool.definition, (toolCallId, signal) =>
-		runner.createToolContext(toolCallId, signal),
+	const { definition, sourceInfo } = registeredTool;
+	return wrapToolDefinition(
+		definition,
+		(toolCallId, signal) => runner.createToolContext(toolCallId, signal),
+		(toolCallId) => {
+			const managed = runner.captureManagedTool(toolCallId, toolSource(definition.name));
+			// These built-in tools are audited: bash is gated, the others start no processes.
+			const trusted =
+				sourceInfo.source === "builtin" && ["bash", "read", "edit", "write", "ls"].includes(definition.name);
+			if (managed && !trusted && !definition.processCoverage)
+				managed.attempt.registry.gap(managed, "unsupported-tool");
+			return managed;
+		},
 	);
 }
 
