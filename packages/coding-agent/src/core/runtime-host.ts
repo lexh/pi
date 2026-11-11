@@ -19,6 +19,7 @@ import type {
 	RuntimeExchange,
 	RuntimeVerification,
 } from "./runtime-lifecycle-types.ts";
+import { TaskFinalizationBook } from "./task-finalization.ts";
 
 type CallContext = {
 	scope: RuntimeIncarnation;
@@ -60,6 +61,8 @@ export class RuntimeHost {
 	#connections = new WeakMap<RuntimeExchange, Connection>();
 	/** Process-lifetime spawn journal; it outlives every runtime incarnation of this host. */
 	readonly processes = new ManagedProcessRegistry();
+	/** Process-lifetime stop and finalization latches of managed tasks; they share the journal's attempt state. */
+	readonly taskFinalizations = new TaskFinalizationBook((id) => this.processes.attemptState(id));
 	constructor(
 		options: {
 			process?: HostProcessIdentity;

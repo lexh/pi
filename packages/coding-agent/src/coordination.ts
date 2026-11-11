@@ -92,6 +92,7 @@ export type {
 	ProcessSource,
 	RegistrationReceipt,
 	SpawnIntent,
+	StopReceipt,
 } from "./core/managed-process-types.ts";
 export {
 	assertExtensionRequestAdmissionSupport,
@@ -143,3 +144,9 @@ export type {
 	RuntimeResourceKind,
 	RuntimeRevocationReason,
 } from "./core/runtime-lifecycle-types.ts";
+export type {
+	BatchCertificate,
+	FinalizationBinding,
+	FinalizationCommit,
+	FinalizationDeclaration,
+} from "./core/task-finalization.ts";

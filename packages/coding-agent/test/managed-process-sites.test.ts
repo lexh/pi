@@ -6,16 +6,15 @@ import { Type } from "typebox";
 import { expect, test } from "vitest";
 import { execCommand } from "../src/core/exec.ts";
 import type { ExtensionAPI, ToolDefinition } from "../src/core/extensions/types.ts";
-import { type ManagedCallContext, withManagedCall } from "../src/core/managed-process-context.ts";
+import { withManagedCall } from "../src/core/managed-process-context.ts";
 import { launchManaged } from "../src/core/managed-process-launch.ts";
-import { ManagedProcessOwner } from "../src/core/managed-process-owner.ts";
 import type { ProcessGap } from "../src/core/managed-process-types.ts";
 import { getProcessRuntimeHost } from "../src/core/runtime-host.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { createLocalBashOperations } from "../src/core/tools/bash.ts";
 import { wrapToolDefinition } from "../src/core/tools/tool-definition-wrapper.ts";
 import { FakeRuntimeCoordinator } from "./helpers/fake-runtime-coordinator.ts";
-import { deferred, fixture } from "./helpers/managed-process.ts";
+import { deferred, fixture, offlineOwner } from "./helpers/managed-process.ts";
 import { createHarness } from "./suite/harness.ts";
 import { createTestExtensionsResult, createTestResourceLoader } from "./utilities.ts";
 
@@ -395,42 +394,6 @@ test.skipIf(process.platform !== "darwin")(
 		}
 	},
 );
-
-/** An owner whose saved lifecycle is offline: attempts are allocated but no fence can be captured. */
-function offlineOwner(f: ReturnType<typeof fixture>, context: ManagedCallContext) {
-	const lifecycle = {
-		inspect: () => ({
-			state: "pending" as const,
-			hostId: "host-one",
-			instanceId: "instance-one",
-			incarnation: 1,
-			epoch: 0,
-			process: { pid: 44, birthNonce: "n" },
-			conversation: context.attempt.intent.provenance.conversation,
-		}),
-		capture: () => {
-			throw new Error("offline");
-		},
-		isCurrent: () => false,
-		participate: () => {},
-		reconcile: async () => "applied" as const,
-		disconnect: () => {},
-		cancel: () => {},
-		track: () => () => {},
-	};
-	return new ManagedProcessOwner(
-		{
-			processes: f.registry,
-			reconcileProcesses: async () => {},
-			reconcileProcessAttempt: async (_adapter, target) => ({
-				...target,
-				through: f.registry.inspect().reconciledThrough,
-			}),
-		},
-		lifecycle,
-		async () => {},
-	);
-}
 
 function plainTool(execute: ToolDefinition["execute"]): ToolDefinition {
 	return { name: "plain", label: "plain", description: "fixture", parameters: Type.Object({}), execute };

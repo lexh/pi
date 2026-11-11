@@ -45,6 +45,9 @@ export function assertManagedProcessSupport(value: unknown): asserts value is Ma
 			"inspect",
 			"requestStop",
 			"managedSpawn",
+			"acknowledgeStop",
+			"declareTaskFinalization",
+			"reconcileFinalizations",
 		].every((key) => typeof (facade as Record<string, unknown>)[key] === "function")
 	)
 		throw new Error(unsupported);

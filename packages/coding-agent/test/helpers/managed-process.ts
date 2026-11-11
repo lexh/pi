@@ -1,8 +1,10 @@
 import { randomUUID } from "node:crypto";
 import type { ManagedCallContext } from "../../src/core/managed-process-context.ts";
+import { type ManagedOwnerHost, ManagedProcessOwner } from "../../src/core/managed-process-owner.ts";
 import { ManagedProcessRegistry } from "../../src/core/managed-process-registry.ts";
 import type { AttemptIntent, ManagedProcessAdapter, SpawnIntent } from "../../src/core/managed-process-types.ts";
 import type { RuntimeFence } from "../../src/core/runtime-lifecycle-types.ts";
+import { TaskFinalizationBook } from "../../src/core/task-finalization.ts";
 
 export function deferred<T>() {
 	return Promise.withResolvers<T>();
@@ -23,10 +25,14 @@ export function fence(instanceId = "instance-one"): RuntimeFence {
 }
 export function fixture(adapterOverrides: Partial<ManagedProcessAdapter> = {}) {
 	const registry = new ManagedProcessRegistry();
+	// The host owns one book next to the registry and shares its per-attempt state.
+	const taskFinalizations = new TaskFinalizationBook((id) => registry.attemptState(id));
 	const intents: SpawnIntent[] = [];
 	const opened: AttemptIntent[] = [];
 	const adapter: ManagedProcessAdapter = {
 		proveHost: async () => {},
+		finalize: async () => "committed",
+		abortReceipt: async () => {},
 		open: async (input) => {
 			opened.push(input);
 			return { attemptId: input.attemptId, marker: input.marker };
@@ -48,13 +54,17 @@ export function fixture(adapterOverrides: Partial<ManagedProcessAdapter> = {}) {
 		}),
 		...adapterOverrides,
 	};
-	const begin = (id: string = randomUUID(), instanceId = "instance-one"): ManagedCallContext => ({
+	const begin = (
+		id: string = randomUUID(),
+		instanceId = "instance-one",
+		runId: string | null = null,
+	): ManagedCallContext => ({
 		attempt: registry.begin(
 			{
 				operationId: `open-${id}`,
 				attemptId: id,
 				marker: `marker-${id}`,
-				runId: null,
+				runId,
 				provenance: {
 					hostId: "host-one",
 					instanceId,
@@ -78,5 +88,51 @@ export function fixture(adapterOverrides: Partial<ManagedProcessAdapter> = {}) {
 		pgid: 41,
 		marker: context.attempt.intent.marker,
 	});
-	return { registry, adapter, begin, intent, intents, opened };
+	return { registry, taskFinalizations, adapter, begin, intent, intents, opened };
+}
+
+/**
+ * An owner whose saved lifecycle is offline: attempts are allocated, but no fence can be captured. Its host is the
+ * fixture's registry and book; `reconcileProcessAttempt` defaults to reporting the last complete image.
+ */
+export function offlineOwner(
+	f: ReturnType<typeof fixture>,
+	context: ManagedCallContext,
+	options: {
+		abortRun?: (attemptId: string) => Promise<void>;
+		reconcileProcessAttempt?: ManagedOwnerHost["reconcileProcessAttempt"];
+	} = {},
+) {
+	const lifecycle = {
+		inspect: () => ({
+			state: "pending" as const,
+			hostId: "host-one",
+			instanceId: "instance-one",
+			incarnation: 1,
+			epoch: 0,
+			process: { pid: 44, birthNonce: "n" },
+			conversation: context.attempt.intent.provenance.conversation,
+		}),
+		capture: () => {
+			throw new Error("offline");
+		},
+		isCurrent: () => false,
+		participate: () => {},
+		reconcile: async () => "applied" as const,
+		disconnect: () => {},
+		cancel: () => {},
+		track: () => () => {},
+	};
+	return new ManagedProcessOwner(
+		{
+			processes: f.registry,
+			taskFinalizations: f.taskFinalizations,
+			reconcileProcesses: async () => {},
+			reconcileProcessAttempt:
+				options.reconcileProcessAttempt ??
+				(async (_adapter, target) => ({ ...target, through: f.registry.inspect().reconciledThrough })),
+		},
+		lifecycle,
+		options.abortRun ?? (async () => {}),
+	);
 }

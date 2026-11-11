@@ -1,5 +1,6 @@
 import type { ChildProcess } from "node:child_process";
 import type { ConversationBinding, HostProcessIdentity, RuntimeFence } from "./runtime-lifecycle-types.ts";
+import type { BatchCertificate, FinalizationDeclaration } from "./task-finalization.ts";
 
 export type ProcessKey = { pid: number; birth: string };
 export type ProcessSource = "bash" | "user-bash" | "pi-exec" | "extension" | "job";
@@ -93,6 +94,17 @@ export interface RegistrationReceipt {
 	watchId: string;
 	revision: number;
 }
+/**
+ * An acknowledgement of a service stop, sent under the attempt's original launch fence: `requested` once the attempt
+ * is latched, `settled` once its local work ended. `registryThrough` is the frozen journal watermark it covers.
+ */
+export interface StopReceipt {
+	operationId: string;
+	attemptId: string;
+	stopId: string;
+	phase: "requested" | "settled";
+	registryThrough: number;
+}
 export interface ManagedProcessAdapter {
 	proveHost(auth: ProcessAuthentication, readSelfBirth: () => string | null): Promise<void>;
 	open(input: AttemptIntent, fence: RuntimeFence): Promise<{ attemptId: string; marker: string }>;
@@ -106,6 +118,10 @@ export interface ManagedProcessAdapter {
 		image: ProcessJournalPage,
 		auth: ProcessAuthentication,
 	): Promise<{ acknowledgedThrough: number; cleanup: CleanupReceipt[] }>;
+	/** Delivers a frozen full-batch certificate over the host-authenticated retained route. */
+	finalize(certificate: BatchCertificate): Promise<"committed" | "superseded">;
+	/** Delivers a stop acknowledgement under the attempt's original launch fence. */
+	abortReceipt(input: StopReceipt, fence: RuntimeFence): Promise<void>;
 }
 export interface ManagedSpawnOptions {
 	cwd?: string;
@@ -137,5 +153,11 @@ export interface ManagedProcesses {
 		reconciledThrough: number;
 	};
 	requestStop(attemptId: string, stopId: string): { requested: true; settled: Promise<void> };
+	/** Sends a stop acknowledgement through the adapter, under the attempt's original launch fence. */
+	acknowledgeStop(receipt: StopReceipt): Promise<void>;
+	/** Stages the end of the calling task, effective only if its declaring tool call completes the full batch. */
+	declareTaskFinalization(declaration: FinalizationDeclaration): void;
+	/** Delivers every pending full-batch certificate; an unanswered one stays pending. */
+	reconcileFinalizations(): Promise<void>;
 	managedSpawn(command: string, args: readonly string[], options?: ManagedSpawnOptions): Promise<ManagedChild>;
 }

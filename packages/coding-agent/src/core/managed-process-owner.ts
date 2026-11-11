@@ -10,11 +10,15 @@ import type {
 	ManagedProcesses,
 	ManagedSpawnOptions,
 	ProcessSource,
+	StopReceipt,
 } from "./managed-process-types.ts";
 import type { RuntimeFence, RuntimeLifecycle } from "./runtime-lifecycle-types.ts";
+import type { BatchCertificate, FinalizationDeclaration, TaskFinalizationBook } from "./task-finalization.ts";
+import { conversationKeyOf } from "./task-finalization.ts";
 
 export interface ManagedOwnerHost {
 	processes: ManagedProcessRegistry;
+	taskFinalizations: TaskFinalizationBook;
 	reconcileProcesses(adapter: ManagedProcessAdapter): Promise<void>;
 	reconcileProcessAttempt(
 		adapter: ManagedProcessAdapter,
@@ -66,6 +70,9 @@ export class ManagedProcessOwner {
 					reconciledThrough: 0,
 				},
 			requestStop: (attemptId: string, stopId: string) => this.requestStop(attemptId, stopId),
+			acknowledgeStop: (receipt: StopReceipt) => this.acknowledgeStop(receipt),
+			declareTaskFinalization: (declaration: FinalizationDeclaration) => this.declareFinalization(declaration),
+			reconcileFinalizations: () => this.reconcileFinalizations(),
 			managedSpawn: (command: string, args: readonly string[], options?: ManagedSpawnOptions) =>
 				this.spawn(command, args, options),
 		});
@@ -204,7 +211,73 @@ export class ManagedProcessOwner {
 		const state = this.lifecycle.inspect();
 		if (!target || state.state === "unavailable" || target.intent.provenance.instanceId !== state.instanceId)
 			throw new Error("Stop belongs to another runtime");
+		// Latch task finalization first: nothing a cancellation or abort callback does may still end the task as a success.
+		this.host.taskFinalizations.stop(attemptId);
 		return this.host.processes.requestStop(attemptId, stopId, () => this.abortRun(attemptId));
+	}
+	/**
+	 * Sends a stop acknowledgement under the attempt's own launch fence. The attempt may belong to an earlier runtime
+	 * of this process; a successor's fence is never substituted.
+	 */
+	private async acknowledgeStop(receipt: StopReceipt): Promise<void> {
+		const target = this.host?.processes.attempts.get(receipt.attemptId);
+		if (!target?.fence || !this.adapter) throw new Error("Original stop provenance is unavailable");
+		await this.adapter.abortReceipt(receipt, target.fence);
+	}
+	private declareFinalization(declaration: FinalizationDeclaration): void {
+		this.assertActive();
+		const context = currentManagedCall();
+		if (
+			!context ||
+			context.toolCallId !== declaration.declarationToolCallId ||
+			context.attempt.stopping ||
+			context.attempt.retired ||
+			context.attempt.ended ||
+			!this.host
+		)
+			throw new Error("Finalization requires this active managed tool call");
+		const binding = this.host.taskFinalizations.current(
+			conversationKeyOf(context.attempt.intent.provenance.conversation),
+		);
+		if (!binding || binding.attemptId !== context.attempt.intent.attemptId)
+			throw new Error("Finalization belongs to another run");
+		this.host.taskFinalizations.stage(binding, declaration);
+	}
+	/**
+	 * Sends the certificate of an original, locally ended agent run. The covering COMPLETE image is drained once and
+	 * its watermark frozen into the wire certificate, so every retry sends identical bytes, whatever siblings do.
+	 */
+	async commitFinalization(certificate: BatchCertificate): Promise<"committed" | "superseded"> {
+		const target = this.host?.processes.attempts.get(certificate.attemptId);
+		const adapter = this.adapter;
+		if (!target || !this.host || !adapter) throw new Error("Finalization transport is unavailable");
+		if (target.intent.runId !== certificate.runId || !target.ended)
+			throw new Error("Certificate does not match the original ended agent run");
+		type Transmission = { intent: string; target: AttemptJournalTarget; wire?: BatchCertificate };
+		const state = this.host.processes.attemptState(certificate.attemptId);
+		const intent = JSON.stringify(certificate);
+		let transmission = state.get("finalization-transmission") as Transmission | undefined;
+		if (!transmission) {
+			// Captured after the ended latch, so the image that covers it includes the end.
+			transmission = { intent, target: this.host.processes.captureAttemptVersion(certificate.attemptId) };
+			state.set("finalization-transmission", transmission);
+		}
+		if (transmission.intent !== intent) throw new Error("Finalization certificate changed");
+		if (!transmission.wire) {
+			const covered = await this.host.reconcileProcessAttempt(adapter, transmission.target);
+			// Concurrent callers freeze one wire: the first to get here wins.
+			transmission.wire ??= freezeWire(certificate, covered.through);
+		}
+		return adapter.finalize(transmission.wire);
+	}
+	async reconcileFinalizations(): Promise<void> {
+		if (!this.host || !this.adapter) return;
+		for (const target of this.host.processes.attempts.values()) {
+			if (!this.host.taskFinalizations.pending(target.intent.attemptId)) continue;
+			await this.host.taskFinalizations.reconcile(target.intent.attemptId, (certificate) =>
+				this.commitFinalization(certificate),
+			);
+		}
 	}
 	private spawn(command: string, args: readonly string[], options: ManagedSpawnOptions = {}): Promise<ManagedChild> {
 		const controller = new AbortController();
@@ -254,4 +327,12 @@ export class ManagedProcessOwner {
 			},
 		);
 	}
+}
+
+/** The wire form of a certificate: a deeply frozen copy that carries the covering image's watermark. */
+function freezeWire(certificate: BatchCertificate, registryThrough: number): BatchCertificate {
+	const wire = { ...structuredClone(certificate), registryThrough };
+	for (const result of wire.toolResults) Object.freeze(result);
+	Object.freeze(wire.toolResults);
+	return Object.freeze(wire);
 }

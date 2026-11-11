@@ -62,6 +62,35 @@ test("the public API exposes the descriptor and both guards, and keeps registry 
 	}
 });
 
+test("the facade exposes stop acknowledgement and finalization, and the guard requires every member", async () => {
+	const h = await createHarness();
+	try {
+		const facade = h.session.managedProcesses;
+		const members = [
+			"acknowledgeStop",
+			"bind",
+			"captureAttemptVersion",
+			"declareTaskFinalization",
+			"inspect",
+			"managedSpawn",
+			"reconcile",
+			"reconcileAttempt",
+			"reconcileFinalizations",
+			"requestStop",
+		];
+		expect(Object.keys(facade).sort()).toEqual(members);
+		for (const member of members) {
+			const broken = {
+				managedProcessCapabilities: MANAGED_PROCESS_CAPABILITIES,
+				managedProcesses: { ...facade, [member]: undefined },
+			};
+			expect(() => publicApi.assertManagedProcessSupport(broken)).toThrow(/disabled/);
+		}
+	} finally {
+		h.cleanup();
+	}
+});
+
 test("the managed-spawn example runs as a tool and reports the local exit", async () => {
 	const h = await createHarness({ extensionFactories: [managedExample] });
 	try {
