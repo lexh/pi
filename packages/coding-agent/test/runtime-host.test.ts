@@ -67,16 +67,24 @@ describe("process runtime host", () => {
 	it("refuses a standalone cell belonging to a different package version", () => {
 		const host = firstUser.getProcessRuntimeHost();
 		expect(() =>
-			firstUser.validateProcessHostCell({ version: 1, packageVersion: "different-package-version", host }),
+			firstUser.validateProcessHostCell({ version: 2, packageVersion: "different-package-version", host }),
 		).toThrow(/unavailable/);
 		expect(firstUser.getProcessRuntimeHost()).toBe(host);
 	});
 
 	it("rejects incompatible and malformed cells without touching the live singleton", () => {
-		for (const value of [undefined, null, {}, { version: 2 }, { version: 1, host: {} }]) {
+		const host = firstUser.getProcessRuntimeHost();
+		// Version 1 cells predate the process registry and must not be adopted.
+		for (const value of [
+			undefined,
+			null,
+			{},
+			{ version: 2 },
+			{ version: 1, host: {} },
+			{ version: 1, packageVersion: VERSION, host },
+		]) {
 			expect(() => firstUser.validateProcessHostCell(value)).toThrow(/unavailable/);
 		}
-		const host = firstUser.getProcessRuntimeHost();
-		expect(firstUser.validateProcessHostCell({ version: 1, packageVersion: VERSION, host })).toBe(host);
+		expect(firstUser.validateProcessHostCell({ version: 2, packageVersion: VERSION, host })).toBe(host);
 	});
 });

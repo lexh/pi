@@ -2,6 +2,13 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { isMainThread } from "node:worker_threads";
 import { VERSION } from "../config.ts";
 import { canonicalJson } from "./durable-records.ts";
+import { ManagedProcessRegistry } from "./managed-process-registry.ts";
+import type {
+	AcknowledgedAttemptImage,
+	AttemptJournalTarget,
+	ManagedProcessAdapter,
+	ProcessAuthentication,
+} from "./managed-process-types.ts";
 import { RuntimeIncarnation } from "./runtime-incarnation.ts";
 import type {
 	ConversationBinding,
@@ -29,6 +36,8 @@ type Connection = {
 	waiters: Set<CallContext>;
 };
 const cellKey = Symbol.for("pi.host-runtime.v1");
+// The cell keeps its key and changes only its value schema: a second key would mint a second host credential.
+const cellVersion = 2;
 export function nextCounter(value: number): number {
 	if (!Number.isSafeInteger(value) || value < 0 || value === Number.MAX_SAFE_INTEGER)
 		throw new Error("Runtime lifecycle counter exhausted; coordination is unavailable");
@@ -49,6 +58,8 @@ export class RuntimeHost {
 	#scopes = new Map<string, RuntimeIncarnation>();
 	#failed = false;
 	#connections = new WeakMap<RuntimeExchange, Connection>();
+	/** Process-lifetime spawn journal; it outlives every runtime incarnation of this host. */
+	readonly processes = new ManagedProcessRegistry();
 	constructor(
 		options: {
 			process?: HostProcessIdentity;
@@ -102,6 +113,18 @@ export class RuntimeHost {
 	}
 	getDesiredImage(): HostRuntimeImage {
 		return this.#image;
+	}
+	reconcileProcesses(adapter: ManagedProcessAdapter): Promise<void> {
+		return this.processes.reconcile(adapter, this.processAuthentication());
+	}
+	reconcileProcessAttempt(
+		adapter: ManagedProcessAdapter,
+		target: AttemptJournalTarget,
+	): Promise<AcknowledgedAttemptImage> {
+		return this.processes.reconcileAttempt(target, adapter, this.processAuthentication());
+	}
+	private processAuthentication(): ProcessAuthentication {
+		return { hostId: this.#hostId, credential: this.#credential, process: this.#process };
 	}
 	private makeImage(): HostRuntimeImage {
 		const runtimes = [...this.#scopes.values()]
@@ -350,15 +373,24 @@ export function validateProcessHostCell(value: unknown): RuntimeHost {
 		typeof value !== "object" ||
 		value === null ||
 		!("version" in value) ||
-		value.version !== 1 ||
+		value.version !== cellVersion ||
 		!("packageVersion" in value) ||
 		value.packageVersion !== VERSION ||
 		!("host" in value) ||
 		typeof value.host !== "object" ||
 		value.host === null ||
-		!["open", "getDesiredImage", "acceptReceipt", "add", "change", "remove", "reconcile", "disconnect"].every(
-			(key) => typeof (value.host as Record<string, unknown>)[key] === "function",
-		)
+		![
+			"open",
+			"getDesiredImage",
+			"acceptReceipt",
+			"add",
+			"change",
+			"remove",
+			"reconcile",
+			"disconnect",
+			"reconcileProcesses",
+			"reconcileProcessAttempt",
+		].every((key) => typeof (value.host as Record<string, unknown>)[key] === "function")
 	)
 		throw new Error("Incompatible runtime host cell; coordination is unavailable");
 	return value.host as RuntimeHost;
@@ -367,6 +399,6 @@ export function getProcessRuntimeHost(): RuntimeHost {
 	if (!isMainThread) throw new Error("Worker-thread coordination is unavailable");
 	const cells = process as unknown as Record<symbol, unknown>;
 	if (!(cellKey in cells))
-		cells[cellKey] = Object.freeze({ version: 1, packageVersion: VERSION, host: new RuntimeHost() });
+		cells[cellKey] = Object.freeze({ version: cellVersion, packageVersion: VERSION, host: new RuntimeHost() });
 	return validateProcessHostCell(cells[cellKey]);
 }
