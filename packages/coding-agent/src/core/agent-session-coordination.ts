@@ -27,6 +27,7 @@ export type { RequestAdmission } from "./request-admission-types.ts";
 export * as runtimeHost from "./runtime-host.ts";
 export {
 	createUnavailableRuntimeLifecycle,
+	peekConversationBinding,
 	type RuntimeIncarnation,
 	resolveConversationBinding,
 } from "./runtime-incarnation.ts";

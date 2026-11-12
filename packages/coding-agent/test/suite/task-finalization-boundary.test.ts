@@ -2,15 +2,54 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
+import { registerFauxProvider } from "@earendil-works/pi-ai/compat";
 import { Type } from "typebox";
 import { expect, test, vi } from "vitest";
+import type { ManagedProcessAdapter } from "../../src/core/managed-process-types.ts";
 import { getProcessRuntimeHost } from "../../src/core/runtime-host.ts";
+import { resolveConversationBinding } from "../../src/core/runtime-incarnation.ts";
+import type { ConversationBinding } from "../../src/core/runtime-lifecycle-types.ts";
 import { SessionManager } from "../../src/core/session-manager.ts";
 import { type BatchCertificate, conversationKeyOf } from "../../src/core/task-finalization.ts";
 import { createCoordinationHarness, expectOneAdmission } from "../helpers/coordination.ts";
 import { FakeRuntimeCoordinator } from "../helpers/fake-runtime-coordinator.ts";
 import { deferred, fixture } from "../helpers/managed-process.ts";
-import { createHarness, createTestUiContext } from "./harness.ts";
+import { createHarness, createTestUiContext, type Harness } from "./harness.ts";
+
+/**
+ * A retained helper-attempt fixture on the process-owned book, as a helper task leaves it: bound to the conversation
+ * of the harness session, with no run of its own. It is not a Phase 4 service or helper launch.
+ */
+async function retainHelper(harness: Harness, adapter: ManagedProcessAdapter, conversation: ConversationBinding) {
+	const host = getProcessRuntimeHost();
+	const helper = {
+		attemptId: `retained-helper:${harness.sessionManager.getSessionId()}`,
+		runId: "retained-helper-run",
+		conversationKey: conversationKeyOf(conversation),
+		kind: "helper" as const,
+	};
+	const fence = harness.session.runtimeLifecycle.capture();
+	const retained = host.processes.begin(
+		{
+			operationId: helper.attemptId,
+			attemptId: helper.attemptId,
+			marker: helper.attemptId,
+			runId: helper.runId,
+			provenance: {
+				hostId: fence.hostId,
+				instanceId: fence.instanceId,
+				incarnation: fence.incarnation,
+				conversation: { ...conversation },
+			},
+		},
+		fence,
+		adapter,
+	);
+	retained.state.set("task-kind", "helper");
+	await retained.opening;
+	host.taskFinalizations.bind(helper);
+	return helper;
+}
 
 // A stopped or ended inline run vetoes only itself: a later wake and an unbound ordinary run proceed. A stopped
 // helper, whose task has ended for good, vetoes every later automatic start of its conversation.
@@ -65,41 +104,14 @@ for (const terminal of ["stopped", "ended"] as const) {
 			const key = conversationKeyOf(conversation);
 			const host = getProcessRuntimeHost();
 			const book = host.taskFinalizations;
-			const helper = {
-				attemptId: `retained-helper:${manager.getSessionId()}`,
-				runId: "retained-helper-run",
-				conversationKey: key,
-				kind: "helper" as const,
-			};
-			// This is a retained helper-attempt fixture, not a Phase 4 service/helper launch proof.
+			let helper: Awaited<ReturnType<typeof retainHelper>> | undefined;
 			let running: Promise<void> | undefined;
 			let unbind: (() => void) | undefined;
 			try {
 				await harness.session.bindExtensions({});
 				unbind = harness.session.managedProcesses.bind(f.adapter);
 				scheduler.bind(coordinator);
-				if (retainedHelper) {
-					const fence = harness.session.runtimeLifecycle.capture();
-					const retained = host.processes.begin(
-						{
-							operationId: helper.attemptId,
-							attemptId: helper.attemptId,
-							marker: helper.attemptId,
-							runId: helper.runId,
-							provenance: {
-								hostId: fence.hostId,
-								instanceId: fence.instanceId,
-								incarnation: fence.incarnation,
-								conversation: { ...conversation },
-							},
-						},
-						fence,
-						f.adapter,
-					);
-					retained.state.set("task-kind", "helper");
-					await retained.opening;
-					book.bind(helper);
-				}
+				if (retainedHelper) helper = await retainHelper(harness, f.adapter, conversation);
 				harness.setResponses([
 					fauxAssistantMessage(fauxToolCall("held_boundary", {}), { stopReason: "toolUse" }),
 					fauxAssistantMessage("unused old continuation"),
@@ -108,7 +120,7 @@ for (const terminal of ["stopped", "ended"] as const) {
 				await reached.promise;
 				const endedId = harness.session.managedAttemptId!;
 				expect(book.current(key)?.attemptId).toBe(endedId);
-				if (retainedHelper)
+				if (helper)
 					await harness.session.managedProcesses.requestStop(helper.attemptId, "retained-helper-stop").settled;
 				const stop =
 					terminal === "stopped" ? harness.session.managedProcesses.requestStop(endedId, "first-stop") : undefined;
@@ -298,15 +310,22 @@ for (const scenario of ["answered", "slow", "lost-session", "lost-facade"] as co
 			expect(notices).toEqual([expect.stringContaining("offline finalizer")]);
 			await harness.session.reload();
 			expect(book.pending(attemptId!)).toBe(pending);
-			// Reloading creates an inert runtime: it participates again, then delivers the retained certificate.
-			harness.session.runtimeLifecycle.participate();
+			// Reloading creates an inert runtime that has no conversation until it participates again.
+			const reloaded = harness.session.runtimeLifecycle.inspect();
+			expect(reloaded.state === "unavailable" ? undefined : reloaded.conversation).toBeUndefined();
 			if (scenario === "lost-session") {
+				// The caller's own route needs neither a participating runtime nor a bound adapter.
+				const delivered: BatchCertificate[] = [];
 				await harness.session.reconcileTaskFinalization(async (retained) => {
-					expect(retained).toBe(pending);
+					delivered.push(retained);
 					return "committed";
 				});
+				expect(delivered).toHaveLength(1);
+				expect(delivered[0]).toBe(pending);
 				expect(certificates).toHaveLength(1);
 			} else {
+				// Binding an adapter does need the runtime to participate again.
+				harness.session.runtimeLifecycle.participate();
 				harness.session.managedProcesses.bind(f.adapter);
 				await harness.session.managedProcesses.reconcileFinalizations();
 				expect(certificates).toHaveLength(2);
@@ -319,8 +338,121 @@ for (const scenario of ["answered", "slow", "lost-session", "lost-facade"] as co
 			delayed.resolve();
 			late.resolve();
 			await running?.catch(() => {});
+			// The book is process wide: a certificate this test left pending must not reach another test's reconcile.
+			if (attemptId) await getProcessRuntimeHost().taskFinalizations.reconcile(attemptId, async () => "superseded");
 			harness.cleanup();
 			rmSync(directory, { recursive: true, force: true });
 		}
 	});
 }
+
+// A stopped or ended helper latches its conversation for good, and the latch outlives a reload. The reloaded runtime
+// has no conversation until it participates again, but the run it continues must still end after its tool batch.
+for (const helperState of ["active", "stopped", "ended"] as const) {
+	test(`${helperState} helper latch holds across reload before the runtime participates again`, async () => {
+		const directory = mkdtempSync(join(tmpdir(), "pi-helper-reload-"));
+		const manager = SessionManager.create(directory, join(directory, "sessions"));
+		manager.persistNow();
+		const f = fixture();
+		const harness = await createHarness({
+			sessionManager: manager,
+			settings: { cacheWarming: "off", compaction: { enabled: false } },
+			initialActiveToolNames: ["quick_tool"],
+			extensionFactories: [
+				(pi) => {
+					pi.declareProcessCoverage("no-spawn");
+					pi.registerTool({
+						name: "quick_tool",
+						label: "quick",
+						description: "return at once",
+						processCoverage: "no-spawn",
+						parameters: Type.Object({}),
+						execute: async () => ({ content: [{ type: "text", text: "quick" }], details: {} }),
+					});
+				},
+			],
+		});
+		try {
+			await harness.session.bindExtensions({});
+			harness.session.runtimeLifecycle.participate();
+			await harness.session.runtimeLifecycle.reconcile(new FakeRuntimeCoordinator().exchange);
+			harness.session.managedProcesses.bind(f.adapter);
+			const inspected = harness.session.runtimeLifecycle.inspect();
+			if (inspected.state === "unavailable" || !inspected.conversation)
+				throw new Error("Expected a participating runtime");
+			const helper = await retainHelper(harness, f.adapter, inspected.conversation);
+			const book = getProcessRuntimeHost().taskFinalizations;
+			if (helperState === "stopped")
+				await harness.session.managedProcesses.requestStop(helper.attemptId, "helper-stop").settled;
+			if (helperState === "ended") {
+				// What the full-batch boundary does to a helper's task: stage its declaration, then see the whole batch.
+				book.stage(helper, {
+					operationId: "helper-end",
+					claim: "claimed-success",
+					declarationToolCallId: "finish",
+				});
+				book.boundary(helper, {
+					aborted: false,
+					toolResults: [{ toolCallId: "finish", isError: false }],
+					registryThrough: 1,
+				});
+				// The book is process wide: consume the certificate here, so no other test's reconcile finds it.
+				await book.reconcile(helper.attemptId, async () => "committed");
+			}
+			expect(book.blocks(helper.conversationKey)).toBe(helperState !== "active");
+
+			await harness.session.reload();
+			const reloaded = harness.session.runtimeLifecycle.inspect();
+			expect(reloaded.state === "unavailable" ? undefined : reloaded.conversation).toBeUndefined();
+			// A reload resets the API provider registry, which drops the harness' faux provider.
+			const revived = registerFauxProvider({ api: harness.faux.api });
+			try {
+				revived.setResponses([
+					fauxAssistantMessage(fauxToolCall("quick_tool", {}), { stopReason: "toolUse" }),
+					fauxAssistantMessage("second response"),
+				]);
+				await harness.session.prompt("run after the reload");
+				// A latched conversation ends its run after the tool batch; otherwise the model gets its second turn.
+				expect(revived.state.callCount).toBe(helperState === "active" ? 2 : 1);
+				expect(revived.getPendingResponseCount()).toBe(helperState === "active" ? 0 : 1);
+			} finally {
+				revived.unregister();
+			}
+		} finally {
+			harness.cleanup();
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+}
+
+test("the task conversation key comes from the session until the runtime has a conversation, and follows the session", async () => {
+	const directory = mkdtempSync(join(tmpdir(), "pi-task-key-"));
+	const manager = SessionManager.create(directory, join(directory, "sessions"));
+	const harness = await createHarness({
+		sessionManager: manager,
+		settings: { cacheWarming: "off", compaction: { enabled: false } },
+	});
+	const keyOf = () =>
+		(harness.session as unknown as { _taskConversationKey(): string | undefined })._taskConversationKey();
+	try {
+		// Nothing is saved yet: there is no key, and asking does not save the session.
+		expect(keyOf()).toBeUndefined();
+		expect(existsSync(manager.getSessionFile()!)).toBe(false);
+		manager.persistNow();
+		const key = conversationKeyOf(resolveConversationBinding(manager));
+		expect(keyOf()).toBe(key);
+		// A session switched in place has its own key, and an unsaved one none; the first key is not kept.
+		manager.newSession();
+		expect(keyOf()).toBeUndefined();
+		manager.persistNow();
+		const next = conversationKeyOf(resolveConversationBinding(manager));
+		expect(next).not.toBe(key);
+		expect(keyOf()).toBe(next);
+		// Once the runtime participates its own conversation names the same key.
+		harness.session.runtimeLifecycle.participate();
+		expect(keyOf()).toBe(next);
+	} finally {
+		harness.cleanup();
+		rmSync(directory, { recursive: true, force: true });
+	}
+});

@@ -1,10 +1,14 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { RuntimeHost } from "../src/core/runtime-host.ts";
 import type { RuntimeIncarnation } from "../src/core/runtime-incarnation.ts";
-import { createUnavailableRuntimeLifecycle, resolveConversationBinding } from "../src/core/runtime-incarnation.ts";
+import {
+	createUnavailableRuntimeLifecycle,
+	peekConversationBinding,
+	resolveConversationBinding,
+} from "../src/core/runtime-incarnation.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { savedFixture } from "./helpers/external-events.ts";
 
@@ -315,5 +319,29 @@ describe("local runtime incarnation", () => {
 	});
 	it("refuses ephemeral binding", () => {
 		expect(() => resolveConversationBinding(SessionManager.inMemory())).toThrow(/--no-session/);
+	});
+	it("peeks the binding a saved session resolves to without saving it", () => {
+		const directory = mkdtempSync(join(tmpdir(), "pi-runtime-peek-"));
+		const alias = `${directory}-alias`;
+		try {
+			symlinkSync(directory, alias);
+			const manager = SessionManager.create(alias, alias);
+			const path = manager.getSessionFile()!;
+			// Nothing is saved yet: there is no file to resolve, and looking does not save one.
+			expect(peekConversationBinding(manager)).toBeUndefined();
+			expect(existsSync(path)).toBe(false);
+			manager.persistNow();
+			const peeked = peekConversationBinding(manager);
+			expect(peeked).toEqual(resolveConversationBinding(manager));
+			// The session file is resolved through the alias, as the lifecycle's own binding is.
+			expect(peeked?.sessionFile).toBe(realpathSync(path));
+			expect(peeked?.sessionFile).not.toBe(path);
+		} finally {
+			rmSync(alias, { force: true });
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+	it("peeks nothing for an in-memory session", () => {
+		expect(peekConversationBinding(SessionManager.inMemory())).toBeUndefined();
 	});
 });

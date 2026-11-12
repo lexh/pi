@@ -89,6 +89,7 @@ import {
 	ManagedProcessOwner,
 	newCoordinationRunId,
 	type PrepareRequestContext,
+	peekConversationBinding,
 	REQUEST_ADMISSION_CAPABILITIES,
 	type RequestAdmission,
 	RequestAdmissionOwner,
@@ -476,6 +477,8 @@ export class AgentSession {
 	private _runtimeHost?: runtimeHost.RuntimeHost;
 	/** The finalization binding of the run claimed last; `_activeManagedBinding()` says whether it is still current. */
 	private _managedBinding?: FinalizationBinding;
+	/** The task conversation key of the session itself, resolved once per session id and file. */
+	private _sessionTaskKey?: { piSessionId: string; sessionFile: string; key: string };
 	private _disposed = false;
 	private _unavailable = false;
 	private _replacementInProgress = false;
@@ -524,10 +527,24 @@ export class AgentSession {
 		);
 	}
 
-	/** The key managed tasks are bound under; undefined while this runtime takes no part in managed processes. */
+	/**
+	 * The key managed tasks are bound under: the conversation of the runtime or, while a reloaded runtime has not
+	 * participated again, the one this session resolves to. The process-owned book outlives the runtime, so its
+	 * latches must stay visible in between. Undefined for an unsaved session. Nothing here saves the session.
+	 */
 	private _taskConversationKey(): string | undefined {
 		const state = this._runtimeLifecycle.inspect();
-		return state.state !== "unavailable" && state.conversation ? conversationKeyOf(state.conversation) : undefined;
+		if (state.state !== "unavailable" && state.conversation) return conversationKeyOf(state.conversation);
+		const sessionFile = this.sessionManager.getSessionFile();
+		if (sessionFile === undefined) return undefined;
+		const piSessionId = this.sessionManager.getSessionId();
+		const known = this._sessionTaskKey;
+		if (known?.piSessionId === piSessionId && known.sessionFile === sessionFile) return known.key;
+		const conversation = peekConversationBinding(this.sessionManager);
+		if (!conversation) return undefined;
+		const key = conversationKeyOf(conversation);
+		this._sessionTaskKey = { piSessionId, sessionFile, key };
+		return key;
 	}
 
 	/** The binding of the claimed run, only while that exact run and its managed attempt are current. */
@@ -790,7 +807,8 @@ export class AgentSession {
 
 	/**
 	 * Delivers the pending full-batch certificate of this conversation's current task through `commit`. This is the
-	 * route a reconnect supplies from its retained provenance: a reloaded runtime holds no adapter of its own.
+	 * route a reconnect supplies from its retained provenance: a reloaded runtime holds no adapter of its own, and
+	 * need not have participated again yet.
 	 */
 	reconcileTaskFinalization(commit: FinalizationCommit): Promise<void> {
 		const book = this._runtimeHost?.taskFinalizations;

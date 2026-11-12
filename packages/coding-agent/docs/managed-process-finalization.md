@@ -34,11 +34,11 @@ Sending requires the attempt's original run id and its local ended latch. The ow
 - Pi never waits for host-wide quiescence and never recaptures a successor runtime's fence. The adapter sends over the host-authenticated retained route, and no credential or fence is part of the certificate.
 - The adapter answers `committed` or `superseded`. Either consumes the pending certificate. `superseded` means a stopping or fatal winner was recorded first and the requested outcome was not applied. Any other answer is an error and keeps the certificate pending.
 
-A reloaded runtime holds no adapter until the integration binds one again. After `participate()` and `bind(adapter)`, `managed.reconcileFinalizations()` delivers every pending certificate. `session.reconcileTaskFinalization(commit)` delivers the pending certificate of the conversation's current task through a route the caller supplies instead.
+A reloaded runtime holds no adapter until the integration binds one again. After `participate()` and `bind(adapter)`, `managed.reconcileFinalizations()` delivers every pending certificate. `session.reconcileTaskFinalization(commit)` delivers the pending certificate of the conversation's current task through a route the caller supplies instead; it needs neither a bound adapter nor a new `participate()`, because pi finds the conversation from the session itself.
 
 ## What ends automatic work
 
-- A stopped or finalized helper task ends automatic work for its whole conversation, permanently. It stays ended whatever attempt is selected afterwards and whether or not a run is active.
+- A stopped or finalized helper task ends automatic work for its whole conversation, permanently. It stays ended whatever attempt is selected afterwards and whether or not a run is active. A reload does not lift it, not even before the new runtime participates again.
 - A stopped or finalized inline task ends only its own claimed run. A later wake starts a fresh attempt, and an ordinary run without a bound adapter is never vetoed by it.
 - A helper task is a claimed run that its integration admitted as a helper's. Every other claimed run is an inline task.
 

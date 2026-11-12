@@ -23,6 +23,20 @@ export function resolveConversationBinding(manager: SessionManager): Conversatio
 	const sessionFile = realpathSync(manager.persistNow());
 	return { piSessionId: manager.getSessionId(), sessionFile };
 }
+/**
+ * The binding `resolveConversationBinding` returns for a session that is already saved, read without saving it.
+ * Undefined for an in-memory session and for one whose file does not exist yet.
+ */
+export function peekConversationBinding(manager: SessionManager): ConversationBinding | undefined {
+	const path = manager.getSessionFile();
+	if (!path) return undefined;
+	try {
+		return { piSessionId: manager.getSessionId(), sessionFile: realpathSync(path) };
+	} catch {
+		// A path that cannot be resolved has no conversation to name; a peek must never fail a caller's hot path.
+		return undefined;
+	}
+}
 type Resource = { kind: RuntimeResourceKind; id: string; revoke: (reason: RuntimeRevocationReason) => void };
 export class RuntimeIncarnation implements RuntimeLifecycle {
 	readonly #host: RuntimeHost;
