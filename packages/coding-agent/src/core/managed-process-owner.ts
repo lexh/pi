@@ -26,6 +26,18 @@ export interface ManagedOwnerHost {
 	): Promise<AcknowledgedAttemptImage>;
 }
 
+/** The ids of a helper attempt that the process authority has already reserved and capability-bound. */
+export interface HelperAdmission {
+	attemptId: string;
+	marker: string;
+}
+
+/**
+ * The authority issues ids as lower-case UUIDs. This only checks length and alphabet: the authority validates the
+ * reservation itself.
+ */
+const RESERVED_ID = /^[a-f0-9-]{36}$/;
+
 /**
  * Lifecycle-bound facade over the process-lifetime registry for one runtime incarnation. It allocates an attempt
  * for every claimed agent run and every standalone spawn site, and does nothing until an adapter is bound.
@@ -39,6 +51,7 @@ export class ManagedProcessOwner {
 	private participated = false;
 	private retired = false;
 	private activeRun?: ManagedCallContext;
+	private nextHelper?: HelperAdmission;
 	readonly facade: ManagedProcesses;
 	constructor(
 		host: ManagedOwnerHost | undefined,
@@ -112,6 +125,7 @@ export class ManagedProcessOwner {
 		source: ProcessSource,
 		toolCallId: string,
 		runId: string | null = null,
+		helper?: HelperAdmission,
 	): ManagedCallContext {
 		const state = this.lifecycle.inspect();
 		if (state.state === "unavailable" || !state.conversation || state.state === "retired")
@@ -125,8 +139,8 @@ export class ManagedProcessOwner {
 		const attempt = binding.host.processes.begin(
 			{
 				operationId: randomUUID(),
-				attemptId: randomUUID(),
-				marker: randomUUID(),
+				attemptId: helper?.attemptId ?? randomUUID(),
+				marker: helper?.marker ?? randomUUID(),
 				runId,
 				provenance: {
 					hostId: state.hostId,
@@ -138,14 +152,39 @@ export class ManagedProcessOwner {
 			fence,
 			binding.adapter,
 		);
+		// Read by the task book when the claimed run is bound: this attempt is a helper's.
+		if (helper) attempt.state.set("task-kind", "helper");
 		const context = { attempt, source, toolCallId, standalone: true };
 		this.coverage(context);
 		return context;
 	}
+	/**
+	 * Trusted SDK bootstrap, never part of the facade: the next claimed run becomes the attempt of a helper that the
+	 * process authority has already reserved and bound. The authority validates the reservation; this refuses only
+	 * what pi cannot honor, so the claim that consumes the admission never fails on the ids.
+	 */
+	adoptHelper(admission: HelperAdmission): void {
+		this.assertActive();
+		if (
+			!this.host ||
+			!this.adapter ||
+			this.activeRun ||
+			this.nextHelper ||
+			!RESERVED_ID.test(admission.attemptId) ||
+			!RESERVED_ID.test(admission.marker) ||
+			// begin() throws on an id it has seen, and a settled run's attempt stays retained for the host's lifetime.
+			this.host.processes.attempts.has(admission.attemptId)
+		)
+			throw new Error("Managed helper admission refused");
+		this.nextHelper = { attemptId: admission.attemptId, marker: admission.marker };
+	}
 	/** Allocates the attempt of a claimed agent run, synchronously, before any await of the run. */
 	claimRun(runId: string): ManagedCallContext | undefined {
 		const binding = this.binding();
-		this.activeRun = binding ? this.capture(binding, "extension", runId, runId) : undefined;
+		// One claim consumes the admission, whether or not the run turns out to be managed.
+		const helper = this.nextHelper;
+		this.nextHelper = undefined;
+		this.activeRun = binding ? this.capture(binding, "extension", runId, runId, helper) : undefined;
 		if (this.activeRun) this.activeRun.standalone = false;
 		return this.activeRun;
 	}

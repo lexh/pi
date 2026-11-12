@@ -40,6 +40,6 @@ A reloaded runtime holds no adapter until the integration binds one again. After
 
 - A stopped or finalized helper task ends automatic work for its whole conversation, permanently. It stays ended whatever attempt is selected afterwards and whether or not a run is active. A reload does not lift it, not even before the new runtime participates again.
 - A stopped or finalized inline task ends only its own claimed run. A later wake starts a fresh attempt, and an ordinary run without a bound adapter is never vetoed by it.
-- A helper task is a claimed run that its integration admitted as a helper's. Every other claimed run is an inline task.
+- A helper task is a claimed run that its integration admitted as a helper's with `session.adoptManagedHelper({ attemptId, marker })` (see [Trusted managed helper bootstrap](sdk.md#trusted-managed-helper-bootstrap)). Every other claimed run is an inline task.
 
 Cleanup is separate from outcome. A run that ended without any declaration can still have its roots accounted: the adapter's `reconcile` returns cleanup receipts, and a receipt retires only the roots it names. Finalization decides the claimed outcome and ends automatic work; it does not decide whether work is still running.

@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -5,6 +6,7 @@ import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { registerFauxProvider } from "@earendil-works/pi-ai/compat";
 import { Type } from "typebox";
 import { expect, test, vi } from "vitest";
+import { RuntimeDisposedError } from "../../src/core/agent-session-coordination.ts";
 import type { ManagedProcessAdapter } from "../../src/core/managed-process-types.ts";
 import { getProcessRuntimeHost } from "../../src/core/runtime-host.ts";
 import { resolveConversationBinding } from "../../src/core/runtime-incarnation.ts";
@@ -141,17 +143,19 @@ for (const terminal of ["stopped", "ended"] as const) {
 					match: { kind: "job", attemptId: "fresh-job" },
 				});
 				harness.setResponses([fauxAssistantMessage("fresh wake response")]);
-				const grant = await scheduler.grant({ kind: "job", attemptId: "fresh-job" });
-				await scheduler.refresh();
 				if (retainedHelper) {
+					// The helper's conversation has ended for good, so it takes no new grant and nothing can wake it.
+					await expect(scheduler.grant({ kind: "job", attemptId: "fresh-job" })).rejects.toThrow(
+						"Automatic task execution has ended",
+					);
 					for (let n = 0; n < 10; n++) await scheduler.refresh();
 					await new Promise((resolve) => setTimeout(resolve, 20));
 					expect(harness.faux.state.callCount).toBe(1);
 					expect(coordinator.inspectEvent(event)?.state).toBe("pending");
-					expect(scheduler.inspect().grants.find((value) => value.grantId === grant.grantId)?.state).not.toBe(
-						"consumed",
-					);
+					expect(scheduler.inspect().grants).toEqual([]);
 				} else {
+					await scheduler.grant({ kind: "job", attemptId: "fresh-job" });
+					await scheduler.refresh();
 					await vi.waitFor(() => {
 						expect(harness.faux.state.callCount).toBe(2);
 					});
@@ -177,6 +181,68 @@ for (const terminal of ["stopped", "ended"] as const) {
 			}
 		});
 	}
+}
+
+// A grant armed while the helper was live must not wake it once it has stopped or ended: the reply that makes the
+// grant eligible arrives after the terminal state, and no run may start for it.
+for (const helperState of ["stopped", "ended"] as const) {
+	test(`a grant armed before the helper ${helperState} cannot start a wake afterwards`, async () => {
+		const f = fixture();
+		const coordinated = await createCoordinationHarness({
+			settings: { cacheWarming: "off", compaction: { enabled: false } },
+		});
+		const { harness, scheduler, coordinator } = coordinated;
+		const inspected = harness.session.runtimeLifecycle.inspect();
+		if (inspected.state === "unavailable" || !inspected.conversation)
+			throw new Error("Expected a participating runtime");
+		const book = getProcessRuntimeHost().taskFinalizations;
+		let unbind: (() => void) | undefined;
+		try {
+			await harness.session.bindExtensions({});
+			unbind = harness.session.managedProcesses.bind(f.adapter);
+			scheduler.bind(coordinator);
+			const helper = await retainHelper(harness, f.adapter, inspected.conversation);
+			// Armed while the helper is live: the reply it waits for has not come yet.
+			const armed = await scheduler.grant({ kind: "job", attemptId: "armed-job" });
+			expect(armed.state).toBe("armed");
+			if (helperState === "stopped") {
+				await harness.session.managedProcesses.requestStop(helper.attemptId, "armed-stop").settled;
+			} else {
+				book.stage(helper, {
+					operationId: "armed-end",
+					claim: "claimed-success",
+					declarationToolCallId: "finish",
+				});
+				book.boundary(helper, {
+					aborted: false,
+					toolResults: [{ toolCallId: "finish", isError: false }],
+					registryThrough: 1,
+				});
+				// The book is process wide: consume the certificate here, so no other test's reconcile finds it.
+				await book.reconcile(helper.attemptId, async () => "committed");
+			}
+			expect(book.blocks(helper.conversationKey)).toBe(true);
+			// The reply arrives after the terminal state and makes the armed grant eligible.
+			const reply = coordinator.seedEvent("armed-reply", "ARMED_REPLY_BODY");
+			coordinator.coordination.record({
+				reference: reply,
+				recordedAt: Date.now(),
+				match: { kind: "job", attemptId: "armed-job" },
+			});
+			harness.setResponses([fauxAssistantMessage("must remain unused")]);
+			for (let n = 0; n < 10; n++) await scheduler.refresh();
+			await new Promise((resolve) => setTimeout(resolve, 20));
+			expect(scheduler.inspect().grants.find((value) => value.grantId === armed.grantId)?.state).toBe("eligible");
+			expect(harness.faux.state.callCount).toBe(0);
+			expect(coordinator.inspectEvent(reply)?.state).toBe("pending");
+			await expect(scheduler.grant({ kind: "job", attemptId: "late-job" })).rejects.toThrow(
+				"Automatic task execution has ended",
+			);
+		} finally {
+			unbind?.();
+			coordinated.cleanup();
+		}
+	});
 }
 
 // The provider is the faux one, so its call count is the number of requests the session made.
@@ -454,5 +520,248 @@ test("the task conversation key comes from the session until the runtime has a c
 	} finally {
 		harness.cleanup();
 		rmSync(directory, { recursive: true, force: true });
+	}
+});
+
+// The host admits a helper it has reserved before the next claimed run. A prompt and a wake both claim a run.
+test("an adopted helper keeps its reserved ids through the next prompt and finalizes as a helper", async () => {
+	const certificates: BatchCertificate[] = [];
+	const f = fixture({
+		finalize: async (certificate) => {
+			certificates.push(structuredClone(certificate));
+			return "committed";
+		},
+	});
+	const admission = { attemptId: randomUUID(), marker: randomUUID() };
+	let declaringAttempt: string | undefined;
+	const coordinated = await createCoordinationHarness({
+		settings: { cacheWarming: "off", compaction: { enabled: false } },
+		initialActiveToolNames: ["declare_complete"],
+		extensionFactories: [
+			(pi) => {
+				pi.declareProcessCoverage("no-spawn");
+				pi.registerTool({
+					name: "declare_complete",
+					label: "complete",
+					description: "declare the helper task complete",
+					processCoverage: "no-spawn",
+					parameters: Type.Object({}),
+					execute: async (toolCallId, _params, _signal, _update, ctx) => {
+						declaringAttempt = coordinated.harness.session.managedAttemptId;
+						ctx.managedProcesses.declareTaskFinalization({
+							operationId: "helper-finish",
+							claim: "claimed-success",
+							declarationToolCallId: toolCallId,
+						});
+						return { content: [{ type: "text", text: "declared" }], details: {} };
+					},
+				});
+			},
+		],
+	});
+	const { harness, scheduler, coordinator } = coordinated;
+	const inspected = harness.session.runtimeLifecycle.inspect();
+	if (inspected.state === "unavailable" || !inspected.conversation)
+		throw new Error("Expected a participating runtime");
+	const key = conversationKeyOf(inspected.conversation);
+	const book = getProcessRuntimeHost().taskFinalizations;
+	let unbind: (() => void) | undefined;
+	try {
+		await harness.session.bindExtensions({});
+		unbind = harness.session.managedProcesses.bind(f.adapter);
+		scheduler.bind(coordinator);
+		harness.session.adoptManagedHelper(admission);
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("declare_complete", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("must remain unused"),
+		]);
+		await harness.session.prompt("finish as the reserved helper");
+		// The run's attempt is the reserved one: its ids reached the process authority and the task book.
+		expect(declaringAttempt).toBe(admission.attemptId);
+		expect(f.opened).toHaveLength(1);
+		expect(f.opened[0]).toMatchObject(admission);
+		expect(f.opened[0]!.runId).not.toBeNull();
+		expect(book.current(key)).toMatchObject({ attemptId: admission.attemptId, kind: "helper" });
+		expect(certificates.map((certificate) => certificate.attemptId)).toEqual([admission.attemptId]);
+		// Finalized as a helper: no further request, and the conversation takes no wake or grant afterwards.
+		expect(harness.faux.state.callCount).toBe(1);
+		expect(harness.getPendingResponseCount()).toBe(1);
+		expect(book.blocks(key)).toBe(true);
+		await expect(scheduler.grant({ kind: "job", attemptId: "after-helper" })).rejects.toThrow(
+			"Automatic task execution has ended",
+		);
+	} finally {
+		unbind?.();
+		coordinated.cleanup();
+	}
+});
+
+test("an adopted helper is claimed by the next wake as well, and only that run is the helper", async () => {
+	const f = fixture();
+	const admission = { attemptId: randomUUID(), marker: randomUUID() };
+	const coordinated = await createCoordinationHarness({
+		settings: { cacheWarming: "off", compaction: { enabled: false } },
+	});
+	const { harness, manager, scheduler, coordinator } = coordinated;
+	const inspected = harness.session.runtimeLifecycle.inspect();
+	if (inspected.state === "unavailable" || !inspected.conversation)
+		throw new Error("Expected a participating runtime");
+	const key = conversationKeyOf(inspected.conversation);
+	const book = getProcessRuntimeHost().taskFinalizations;
+	let unbind: (() => void) | undefined;
+	try {
+		await harness.session.bindExtensions({});
+		unbind = harness.session.managedProcesses.bind(f.adapter);
+		scheduler.bind(coordinator);
+		harness.session.adoptManagedHelper(admission);
+		const event = coordinator.seedEvent("helper-wake", "HELPER_WAKE_BODY");
+		coordinator.coordination.record({
+			reference: event,
+			recordedAt: Date.now(),
+			match: { kind: "job", attemptId: "helper-job" },
+		});
+		harness.setResponses([fauxAssistantMessage("helper wake response")]);
+		await scheduler.grant({ kind: "job", attemptId: "helper-job" });
+		await scheduler.refresh();
+		await vi.waitFor(() => {
+			expect(harness.faux.state.callCount).toBe(1);
+		});
+		await harness.session.waitForIdle();
+		expectOneAdmission(manager, event);
+		expect(f.opened).toHaveLength(1);
+		expect(f.opened[0]).toMatchObject(admission);
+		expect(book.current(key)).toMatchObject({ attemptId: admission.attemptId, kind: "helper" });
+		// The admission was used up by that wake: the next run is an ordinary inline task.
+		harness.setResponses([fauxAssistantMessage("ordinary prompt response")]);
+		await harness.session.prompt("a prompt after the helper's wake");
+		expect(f.opened).toHaveLength(2);
+		expect(f.opened[1]!.attemptId).not.toBe(admission.attemptId);
+		expect(book.current(key)).toMatchObject({ attemptId: f.opened[1]!.attemptId, kind: "inline" });
+	} finally {
+		unbind?.();
+		coordinated.cleanup();
+	}
+});
+
+test("a service stop of the adopted helper's run ends the conversation's automatic work", async () => {
+	const reached = deferred<void>();
+	const release = deferred<void>();
+	const f = fixture();
+	const admission = { attemptId: randomUUID(), marker: randomUUID() };
+	const coordinated = await createCoordinationHarness({
+		settings: { cacheWarming: "off", compaction: { enabled: false } },
+		initialActiveToolNames: ["held_helper_tool"],
+		extensionFactories: [
+			(pi) => {
+				pi.declareProcessCoverage("no-spawn");
+				pi.registerTool({
+					name: "held_helper_tool",
+					label: "held",
+					description: "hold the helper's tool batch",
+					processCoverage: "no-spawn",
+					parameters: Type.Object({}),
+					execute: async () => {
+						reached.resolve();
+						await release.promise;
+						return { content: [{ type: "text", text: "finished" }], details: {} };
+					},
+				});
+			},
+		],
+	});
+	const { harness, scheduler, coordinator } = coordinated;
+	const inspected = harness.session.runtimeLifecycle.inspect();
+	if (inspected.state === "unavailable" || !inspected.conversation)
+		throw new Error("Expected a participating runtime");
+	const key = conversationKeyOf(inspected.conversation);
+	const book = getProcessRuntimeHost().taskFinalizations;
+	let running: Promise<void> | undefined;
+	let unbind: (() => void) | undefined;
+	try {
+		await harness.session.bindExtensions({});
+		unbind = harness.session.managedProcesses.bind(f.adapter);
+		scheduler.bind(coordinator);
+		harness.session.adoptManagedHelper(admission);
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("held_helper_tool", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("must remain unused"),
+		]);
+		running = harness.session.prompt("run as the reserved helper");
+		await reached.promise;
+		const stop = harness.session.managedProcesses.requestStop(admission.attemptId, "service-stop");
+		// The latch is synchronous: the conversation is already closed to automatic work.
+		expect(book.blocks(key)).toBe(true);
+		release.resolve();
+		await running;
+		await stop.settled;
+		expect(harness.faux.state.callCount).toBe(1);
+		expect(harness.getPendingResponseCount()).toBe(1);
+		expect(book.blocks(key)).toBe(true);
+		await expect(scheduler.grant({ kind: "job", attemptId: "after-stop" })).rejects.toThrow(
+			"Automatic task execution has ended",
+		);
+	} finally {
+		release.resolve();
+		await running?.catch(() => {});
+		unbind?.();
+		coordinated.cleanup();
+	}
+});
+
+test("session adoption is refused before an adapter is bound and after disposal", async () => {
+	const f = fixture();
+	const coordinated = await createCoordinationHarness({
+		settings: { cacheWarming: "off", compaction: { enabled: false } },
+	});
+	const { harness } = coordinated;
+	const reservation = () => ({ attemptId: randomUUID(), marker: randomUUID() });
+	try {
+		await harness.session.bindExtensions({});
+		// An ordinary session takes no part in managed processes, however trusted the caller.
+		expect(() => harness.session.adoptManagedHelper(reservation())).toThrow(/refused/);
+		harness.session.managedProcesses.bind(f.adapter);
+		harness.session.adoptManagedHelper(reservation());
+		harness.session.dispose();
+		expect(() => harness.session.adoptManagedHelper(reservation())).toThrow(RuntimeDisposedError);
+	} finally {
+		coordinated.cleanup();
+	}
+});
+
+test("a pending admission belongs to the runtime that took it, so a reload leaves the replacement with none", async () => {
+	const f = fixture();
+	const admission = { attemptId: randomUUID(), marker: randomUUID() };
+	const coordinated = await createCoordinationHarness({
+		settings: { cacheWarming: "off", compaction: { enabled: false } },
+	});
+	const { harness, runtimeCoordinator } = coordinated;
+	const inspected = harness.session.runtimeLifecycle.inspect();
+	if (inspected.state === "unavailable" || !inspected.conversation)
+		throw new Error("Expected a participating runtime");
+	const key = conversationKeyOf(inspected.conversation);
+	try {
+		await harness.session.bindExtensions({});
+		harness.session.managedProcesses.bind(f.adapter);
+		harness.session.adoptManagedHelper(admission);
+		await harness.session.reload();
+		harness.session.runtimeLifecycle.participate();
+		await harness.session.runtimeLifecycle.reconcile(runtimeCoordinator.exchange);
+		harness.session.managedProcesses.bind(f.adapter);
+		// A reload resets the API provider registry, which drops the harness' faux provider.
+		const revived = registerFauxProvider({ api: harness.faux.api });
+		try {
+			revived.setResponses([fauxAssistantMessage("run after the reload")]);
+			await harness.session.prompt("the first run of the replacement runtime");
+		} finally {
+			revived.unregister();
+		}
+		expect(f.opened).toHaveLength(1);
+		expect(f.opened[0]!.attemptId).not.toBe(admission.attemptId);
+		expect(getProcessRuntimeHost().taskFinalizations.current(key)).toMatchObject({
+			attemptId: f.opened[0]!.attemptId,
+			kind: "inline",
+		});
+	} finally {
+		coordinated.cleanup();
 	}
 });

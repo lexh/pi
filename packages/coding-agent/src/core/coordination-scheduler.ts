@@ -204,6 +204,7 @@ export class CoordinationSchedulerOwner implements CoordinationScheduler, Coordi
 
 	async grant(target: WakeTarget, signal?: AbortSignal): Promise<GrantReceipt> {
 		signal?.throwIfAborted();
+		if (!this.canStartAutomatic()) throw new Error("Automatic task execution has ended");
 		if (target.kind !== "job" && target.kind !== "idle" && target.kind !== "reply") {
 			throw new Error("Unsupported wake target");
 		}

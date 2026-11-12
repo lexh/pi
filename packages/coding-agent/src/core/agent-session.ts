@@ -806,6 +806,17 @@ export class AgentSession {
 	}
 
 	/**
+	 * Trusted host bootstrap, not for extensions or model tools: the next claimed run (a prompt or a wake) becomes the
+	 * attempt of a helper the host's process authority has already reserved and bound under these ids. Throws when
+	 * pi cannot honor the admission: no bound adapter, a run already claimed, another admission pending, or ids that
+	 * are malformed or already used.
+	 */
+	adoptManagedHelper(input: { attemptId: string; marker: string }): void {
+		this._assertNotDisposed();
+		this._managedProcesses.adoptHelper(input);
+	}
+
+	/**
 	 * Delivers the pending full-batch certificate of this conversation's current task through `commit`. This is the
 	 * route a reconnect supplies from its retained provenance: a reloaded runtime holds no adapter of its own, and
 	 * need not have participated again yet.

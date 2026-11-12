@@ -61,6 +61,18 @@ After a runtime replacement, subscriptions belong to the old `AgentSession` and 
 
 For durable records, external events, runtime lifecycle, ordered request admission, and wake arbitration, see [SDK Coordination](coordination-sdk.md).
 
+## Trusted managed helper bootstrap
+
+A host that has reserved a helper and capability-bound it in its process authority calls `session.adoptManagedHelper({ attemptId, marker })` before the next claimed run, which is a prompt or a wake. This is a trusted SDK bootstrap, not a model tool, not part of `session.managedProcesses`, and not a way to create a helper by choosing an ID. The authority must authenticate that exact reservation, host and conversation, and must refuse a terminal, stopping, foreign or mismatched one. Pi throws only for what it cannot honor itself: a disposed or retired session, no bound adapter (see [Managed processes](coordination-sdk.md#managed-processes)), malformed IDs, an `attemptId` this process already retains, a run that is already claimed, or another admission still pending.
+
+The next claimed run becomes the helper's attempt: it keeps the reserved `attemptId` and `marker`, is opened with the adapter under them, and is the conversation's helper task for finalization. One claim consumes the admission, whether or not that run turns out to be managed, so it never reaches a second run. Standalone user `!` commands, `pi.exec` and `managedSpawn` calls do not consume it. The pending admission belongs to the runtime that took it, so a reload leaves the replacement with none.
+
+The helper completes with `ctx.managedProcesses.declareTaskFinalization({ operationId, claim, declarationToolCallId })` from inside its declaring tool call. The claim stays pending until every tool result of the batch exists, and is then preserved verbatim. The certificate records sibling failures in `toolResults` and declaration timing in `declarationBeforeResults`, so a failing sibling does not downgrade a success claim and a successful sibling does not promote a failure claim. A successful declaration result and unique tool call IDs are required, and an abort or an assistant error cannot finalize a pending claim. The process-owned task book keeps the terminal latch and the certificate outbox across a reload, and a reconnect resends the same certificate, never the command or the model turn. See [Managed stop and full-batch finalization](managed-process-finalization.md).
+
+A stopped or finalized helper ends automatic work for its whole conversation for good. The scheduler refuses new grants, and no post-turn, post-agent, before-settle, deferred settled-action or idle-wake continuation starts. A stop outranks a late declaration, and a `superseded` answer from the authority clears the pending certificate without claiming success.
+
+This is not a helper, worktree or checkpoint workflow, a containment API or a cleanup receipt. Tool return, abort and the end of a run do not account for a helper's processes or release anything the authority holds for it. Cleanup stays the authority's decision.
+
 ## Prompting
 
 `prompt()` handles extension commands and expands file-based prompt templates before ordinary user messages enter the agent. For an accepted agent run, it resolves after the run finishes, including automatic retries.
