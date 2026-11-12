@@ -32,6 +32,7 @@ export {
 } from "./runtime-incarnation.ts";
 export { assertRuntimeLifecycleSupport, RUNTIME_LIFECYCLE_CAPABILITIES } from "./runtime-lifecycle-capabilities.ts";
 export type { RuntimeLifecycle } from "./runtime-lifecycle-types.ts";
+export { conversationKeyOf, type FinalizationBinding, type FinalizationCommit } from "./task-finalization.ts";
 
 export class RuntimeReplacementInProgressError extends Error {
 	constructor() {

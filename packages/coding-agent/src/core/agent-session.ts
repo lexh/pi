@@ -75,6 +75,7 @@ import {
 	COORDINATION_SCHEDULER_CAPABILITIES,
 	type CoordinationScheduler,
 	CoordinationSchedulerOwner,
+	conversationKeyOf,
 	createUnavailableRuntimeLifecycle,
 	currentManagedCall,
 	EXTERNAL_EVENT_CAPABILITIES,
@@ -82,6 +83,8 @@ import {
 	type ExternalEventDisplayItem,
 	ExternalEventReconciler,
 	type ExternalEventRefresh,
+	type FinalizationBinding,
+	type FinalizationCommit,
 	MANAGED_PROCESS_CAPABILITIES,
 	ManagedProcessOwner,
 	newCoordinationRunId,
@@ -449,6 +452,9 @@ function getNextCycleIndex(
 /** Threshold compaction inside a bound request admission: the routed model, the unsent boundary, the fence. */
 type BoundCompaction = { model: Model<string>; firstUnsentEntryId?: string; assertCurrent: () => void };
 
+/** How long a finished run waits for the process authority to answer its full-batch certificate. */
+const FINALIZATION_RESPONSE_TIMEOUT_MS = 1000;
+
 export class AgentSession {
 	readonly externalEventCapabilities = EXTERNAL_EVENT_CAPABILITIES;
 	readonly runtimeLifecycleCapabilities = RUNTIME_LIFECYCLE_CAPABILITIES;
@@ -468,6 +474,8 @@ export class AgentSession {
 	private _coordinationContinuationSuppressed = false;
 	private _firstUnsentEntryId?: string;
 	private _runtimeHost?: runtimeHost.RuntimeHost;
+	/** The finalization binding of the run claimed last; `_activeManagedBinding()` says whether it is still current. */
+	private _managedBinding?: FinalizationBinding;
 	private _disposed = false;
 	private _unavailable = false;
 	private _replacementInProgress = false;
@@ -498,6 +506,7 @@ export class AgentSession {
 		this._coordinationRunId = newCoordinationRunId();
 		this._coordinationContinuationSuppressed = false;
 		this._managedProcesses.claimRun(this._coordinationRunId);
+		this._bindClaimedManagedRun();
 	}
 
 	private _settleCoordination(): void {
@@ -508,7 +517,107 @@ export class AgentSession {
 
 	/** End the turn instead of continuing: reload aborted it, or coordination suppressed continuation. */
 	private _endsTurnForCoordination(signal: AbortSignal | undefined): boolean {
-		return (this._stopReloadTurn && signal?.aborted === true) || this._coordinationContinuationSuppressed;
+		return (
+			(this._stopReloadTurn && signal?.aborted === true) ||
+			this._coordinationContinuationSuppressed ||
+			this._automaticTaskEnded()
+		);
+	}
+
+	/** The key managed tasks are bound under; undefined while this runtime takes no part in managed processes. */
+	private _taskConversationKey(): string | undefined {
+		const state = this._runtimeLifecycle.inspect();
+		return state.state !== "unavailable" && state.conversation ? conversationKeyOf(state.conversation) : undefined;
+	}
+
+	/** The binding of the claimed run, only while that exact run and its managed attempt are current. */
+	private _activeManagedBinding(): FinalizationBinding | undefined {
+		const binding = this._managedBinding;
+		return binding &&
+			binding.runId === this._coordinationRunId &&
+			this._managedProcesses.runContext?.attempt.intent.attemptId === binding.attemptId
+			? binding
+			: undefined;
+	}
+
+	/**
+	 * Whether automatic work has ended. A stopped or finalized helper ends it for its whole conversation; a stopped or
+	 * finalized inline task only for its own claimed run, so a later wake or an unbound ordinary run is never vetoed.
+	 */
+	private _automaticTaskEnded(): boolean {
+		const key = this._taskConversationKey();
+		const book = this._runtimeHost?.taskFinalizations;
+		return key !== undefined && book !== undefined && book.blocks(key, this._activeManagedBinding());
+	}
+
+	/** Binds the managed attempt of the run just claimed, if it has one, in the process-owned task book. */
+	private _bindClaimedManagedRun(): void {
+		this._managedBinding = undefined;
+		const context = this._managedProcesses.runContext;
+		const book = this._runtimeHost?.taskFinalizations;
+		if (!context || !book || !this._coordinationRunId) return;
+		const binding: FinalizationBinding = {
+			attemptId: context.attempt.intent.attemptId,
+			runId: this._coordinationRunId,
+			conversationKey: conversationKeyOf(context.attempt.intent.provenance.conversation),
+			kind: context.attempt.state.get("task-kind") === "helper" ? "helper" : "inline",
+		};
+		book.bind(binding);
+		this._managedBinding = binding;
+	}
+
+	/**
+	 * Called when a turn finishes. When a declared completion's whole tool batch is done, the task ends here: its
+	 * attempt closes to new work synchronously, before the journal target is captured, automatic continuation is
+	 * suppressed, and the certificate is sent. A lost or slow answer leaves it pending in the process-owned book.
+	 * Returns whether automatic execution has ended.
+	 */
+	private async _finishManagedBatch(
+		toolResults: ToolResultMessage[],
+		signal: AbortSignal | undefined,
+		assistantError: boolean,
+	): Promise<boolean> {
+		const binding = this._activeManagedBinding();
+		const attempt = this._managedProcesses.runContext?.attempt;
+		const book = this._runtimeHost?.taskFinalizations;
+		if (!binding || !attempt || !book) return this._automaticTaskEnded();
+		const ended = book.boundary(binding, {
+			aborted:
+				this._agentRunAbortRequested || signal?.aborted === true || this._disposed || this._replacementInProgress,
+			assistantError,
+			registryThrough: () => {
+				attempt.registry.end(attempt);
+				return attempt.registry.through;
+			},
+			toolResults: toolResults.map((result) => ({ toolCallId: result.toolCallId, isError: result.isError })),
+		});
+		if (!ended) return false;
+		this._coordinationContinuationSuppressed = true;
+		this._coordinationScheduler.cancel();
+		// A stopped task has no certificate to send.
+		if (!book.pending(binding.attemptId)) return true;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		try {
+			await Promise.race([
+				book.reconcile(binding.attemptId, (certificate) => this._managedProcesses.commitFinalization(certificate)),
+				new Promise<never>((_resolve, reject) => {
+					timer = setTimeout(
+						() => reject(new Error("Finalization response timed out")),
+						FINALIZATION_RESPONSE_TIMEOUT_MS,
+					);
+				}),
+			]);
+		} catch (error) {
+			this._extensionRunner
+				.getUIContext()
+				.notify(
+					`Automatic task ended; certificate remains pending: ${error instanceof Error ? error.message : String(error)}`,
+					"warning",
+				);
+		} finally {
+			clearTimeout(timer);
+		}
+		return true;
 	}
 
 	/** The selected runtime may have changed while extension listeners were awaited. */
@@ -622,6 +731,7 @@ export class AgentSession {
 				assertCoordinationSchedulerSupport(this);
 				this._cacheWarmer?.cancel();
 			},
+			() => !this._automaticTaskEnded(),
 		);
 		this._requestAdmission = new RequestAdmissionOwner(
 			this._runtimeLifecycle,
@@ -676,6 +786,18 @@ export class AgentSession {
 	/** The attempt of the run being claimed, for the process authority's stop and finalization. */
 	get managedAttemptId(): string | undefined {
 		return this._managedProcesses.attemptId;
+	}
+
+	/**
+	 * Delivers the pending full-batch certificate of this conversation's current task through `commit`. This is the
+	 * route a reconnect supplies from its retained provenance: a reloaded runtime holds no adapter of its own.
+	 */
+	reconcileTaskFinalization(commit: FinalizationCommit): Promise<void> {
+		const book = this._runtimeHost?.taskFinalizations;
+		const key = this._taskConversationKey();
+		if (!book || key === undefined) return Promise.resolve();
+		const binding = book.current(key);
+		return binding ? book.reconcile(binding.attemptId, commit) : Promise.resolve();
 	}
 
 	get isDisposed(): boolean {
@@ -827,7 +949,8 @@ export class AgentSession {
 			this._isEmittingAgentSettled ||
 			this._isAgentRunActive ||
 			this._isBeforeSettle ||
-			this._coordinationScheduler.hasNewStartHolds()
+			this._coordinationScheduler.hasNewStartHolds() ||
+			this._automaticTaskEnded()
 		)
 			return;
 		const claim = this._coordinationScheduler.claimAtSettlement(this._lastActivityOutcome);
@@ -852,6 +975,10 @@ export class AgentSession {
 	}
 
 	private async _startCoordinationRun(claim: WakeClaim): Promise<void> {
+		if (this._automaticTaskEnded()) {
+			this._coordinationScheduler.blocked(claim, "task-ended");
+			return;
+		}
 		this._isAgentRunActive = true;
 		this._agentRunAbortRequested = false;
 		this._requestSuppressed = false;
@@ -859,6 +986,7 @@ export class AgentSession {
 		this._coordinationRunId = newCoordinationRunId();
 		this._coordinationContinuationSuppressed = false;
 		this._managedProcesses.claimRun(this._coordinationRunId);
+		this._bindClaimedManagedRun();
 
 		this._coordinationScheduler.startClaim(claim);
 		let updateMessage: AgentMessage | undefined;
@@ -1468,6 +1596,8 @@ export class AgentSession {
 			this._boundaryDispatchedMessages.add(turn.message);
 			const extensionContinue = await this._dispatchTurnEndBoundary(turn.message, turn.toolResults);
 			const previousDecision = await previousFinishTurn?.(turn, signal);
+			if (await this._finishManagedBatch(turn.toolResults, signal, turn.message.stopReason === "error"))
+				return { action: "end" };
 			if (this._endsTurnForCoordination(signal)) return { action: "end" };
 			if (previousDecision?.action === "end") return previousDecision;
 			if (extensionContinue || previousDecision?.action === "continue") return { action: "continue" };
@@ -1673,7 +1803,10 @@ export class AgentSession {
 		const deferred = this._deferredSettledActions.splice(0);
 		if (deferred.length > 0) {
 			try {
-				for (const action of deferred) await action();
+				for (const action of deferred) {
+					if (this._automaticTaskEnded()) break;
+					await action();
+				}
 			} finally {
 				this._resolveIdleWaitIfIdle();
 			}
@@ -2520,16 +2653,23 @@ export class AgentSession {
 			while (
 				!this._agentRunAbortRequested &&
 				!this._requestSuppressed &&
-				!this._coordinationContinuationSuppressed
+				!this._coordinationContinuationSuppressed &&
+				!this._automaticTaskEnded()
 			) {
 				if (await this._handlePostAgentRun()) {
-					if (this._agentRunAbortRequested || this._coordinationContinuationSuppressed) break;
+					if (
+						this._agentRunAbortRequested ||
+						this._coordinationContinuationSuppressed ||
+						this._automaticTaskEnded()
+					)
+						break;
 					await this.agent.continue();
 					continue;
 				}
 				if (this._admissionPossibleCommit && this._lastAssistantMessage?.stopReason === "error") break;
 				const natural = await this._runBeforeSettleBoundary();
-				if (this._agentRunAbortRequested || this._coordinationContinuationSuppressed) break;
+				if (this._agentRunAbortRequested || this._coordinationContinuationSuppressed || this._automaticTaskEnded())
+					break;
 				if (natural) {
 					await this.agent.continue();
 					continue;
@@ -2616,7 +2756,7 @@ export class AgentSession {
 	}
 
 	private async _handlePostAgentRun(): Promise<boolean> {
-		if (this._requestSuppressed || this._admissionPossibleCommit) return false;
+		if (this._requestSuppressed || this._admissionPossibleCommit || this._automaticTaskEnded()) return false;
 		const message = this._lastAssistantMessage;
 		this._lastAssistantMessage = undefined;
 		if (this._agentRunAbortRequested) {
@@ -2655,6 +2795,7 @@ export class AgentSession {
 	}
 
 	private async _runBeforeSettleBoundary(): Promise<boolean> {
+		if (this._automaticTaskEnded()) return false;
 		if (!this._extensionRunner.hasHandlers("agent_before_settle")) return this.agent.hasQueuedMessages();
 		this._isBeforeSettle = true;
 		this._abortDuringBeforeSettle = false;
@@ -2666,7 +2807,7 @@ export class AgentSession {
 			this._commitBoundaryDrafts(result.entries);
 			this._flushPendingCustomMessages();
 			const finalContext = this._buildBoundaryContext([], "agent_before_settle");
-			if (this._abortDuringBeforeSettle) return false;
+			if (this._abortDuringBeforeSettle || this._automaticTaskEnded()) return false;
 			const shouldContinue = result.continue || this.agent.hasQueuedMessages();
 			if (shouldContinue && !finalContext.canContinue) {
 				if (result.continue) this._reportInvalidBoundaryContinuation("agent_before_settle");

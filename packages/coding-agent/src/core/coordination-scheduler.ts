@@ -44,6 +44,8 @@ export class CoordinationSchedulerOwner implements CoordinationScheduler, Coordi
 	private readonly getRunIdCallback: () => string | undefined;
 	private readonly requestIdleReconsiderationCallback?: () => void;
 	private readonly onBindCallback?: () => void;
+	/** False once the conversation's managed task has stopped or ended: no wake or settlement claim may start. */
+	private readonly canStartAutomatic: () => boolean;
 
 	private permissionEpoch = 0;
 	private readonly claims = new CoordinationClaims();
@@ -77,6 +79,7 @@ export class CoordinationSchedulerOwner implements CoordinationScheduler, Coordi
 		getRunId: () => string | undefined,
 		requestIdleReconsideration?: () => void,
 		onBind?: () => void,
+		canStartAutomatic: () => boolean = () => true,
 	) {
 		this.lifecycle = lifecycle;
 		this.requestAdmission = requestAdmission;
@@ -87,6 +90,7 @@ export class CoordinationSchedulerOwner implements CoordinationScheduler, Coordi
 		this.getRunIdCallback = getRunId;
 		this.requestIdleReconsiderationCallback = requestIdleReconsideration;
 		this.onBindCallback = onBind;
+		this.canStartAutomatic = canStartAutomatic;
 	}
 
 	setRequestAdmission(owner: RequestAdmissionOwner): void {
@@ -443,7 +447,7 @@ export class CoordinationSchedulerOwner implements CoordinationScheduler, Coordi
 	}
 
 	claimAtSettlement(lastOutcome?: string): WakeClaim | undefined {
-		if (this.retired || !this.adapter) return undefined;
+		if (!this.canStartAutomatic() || this.retired || !this.adapter) return undefined;
 		if (lastOutcome === "error" || lastOutcome === "aborted") return undefined;
 		let scope: PermissionScope;
 		try {
@@ -464,6 +468,10 @@ export class CoordinationSchedulerOwner implements CoordinationScheduler, Coordi
 	}
 
 	startClaim(claim: WakeClaim): void {
+		if (!this.canStartAutomatic()) {
+			this.blocked(claim, "task-ended");
+			throw new Error("Automatic task execution has ended");
+		}
 		this.activeClaim = claim;
 		this.pendingActivation = claim;
 	}
@@ -483,12 +491,12 @@ export class CoordinationSchedulerOwner implements CoordinationScheduler, Coordi
 	}
 
 	requestReconsideration(): void {
-		if (this.reconsiderationScheduled || this.retired || !this.adapter) return;
+		if (!this.canStartAutomatic() || this.reconsiderationScheduled || this.retired || !this.adapter) return;
 		this.reconsiderationScheduled = true;
 		queueMicrotask(() => {
 			queueMicrotask(() => {
 				this.reconsiderationScheduled = false;
-				if (this.retired || !this.adapter) return;
+				if (!this.canStartAutomatic() || this.retired || !this.adapter) return;
 				this.requestIdleReconsiderationCallback?.();
 			});
 		});
